@@ -4,45 +4,25 @@
 [![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Production-ready real-time bi-directional sync server for Realm databases with MongoDB persistence, conflict resolution, and optimistic updates.**
+Real-time, offline-first sync for Realm-backed apps. Socket.IO + MongoDB with timestamp-based conflict resolution. Built for mobile and web.
 
-Built for mobile and web applications requiring offline-first data synchronization with automatic conflict resolution and real-time updates across multiple devices.
+## ✨ Highlights
 
-## ✨ Features
-
-### Core Synchronization
-- 🔄 **Real-time bi-directional sync** via Socket.IO WebSockets
-- 📱 **Offline-first architecture** with persistent outbox queue
-- ⚡ **Optimistic updates** for instant UI responsiveness
-- 🔀 **Automatic conflict resolution** using last-write-wins (timestamp-based)
-- 🔁 **Exponential backoff reconnection** with configurable retry policies
-- 📊 **Historical sync** to catch up on missed changes after offline periods
-- 🎯 **Subscription-based filtering** for scalable data partitioning
-
-### Enterprise Features
-- 🔐 **JWT authentication** support (optional)
-- 🛡️ **Rate limiting** protection against abuse
-- 📝 **Change audit log** for compliance and debugging
-- 🔍 **Flexible Query Language** with MongoDB query translation
-- 🌐 **Azure Web PubSub** integration for massive scalability
-- 📦 **Batch operations** for efficient bulk updates
-- 🏥 **Health monitoring** endpoints with metrics
-
-### Developer Experience
-- 🎨 **TypeScript-first** with full type safety
-- 🧪 **Comprehensive test suite** with Jest
-- 📚 **Rich client SDK** for easy integration
-- 🔧 **Hot reload** in development mode
-- 📈 **Built-in benchmarking** tools
-- 🐛 **Detailed logging** with configurable levels
+- 🔄 Real-time bi-directional sync over WebSockets
+- 📱 Offline-first with durable outbox queue
+- ⚡ Optimistic updates; instant UI then server-verify
+- 🔀 Conflict resolution via last-write-wins timestamps
+- 🎯 Flexible subscriptions (server-side filtering)
+- 🔐 JWT auth, 🛡️ rate limiting, 📝 audit log
+- 🌐 Optional Azure Web PubSub for horizontal scale
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
-- **Node.js 18+** and npm
-- **MongoDB 5.0+** (local or Atlas)
-- **Azure subscription** (for Web PubSub scaling - optional for development)
+- Node.js 18+
+- MongoDB 5.0+ (local or Atlas)
+- Azure subscription (optional; for Web PubSub scaling)
 
 ### Installation
 
@@ -52,7 +32,7 @@ npm install
 
 ### Configuration
 
-Create a `.env` file in the root directory:
+Create a `.env` file:
 
 ```bash
 # MongoDB Configuration
@@ -86,7 +66,7 @@ Server starts on `http://localhost:3000`
 **Health check:** http://localhost:3000/health  
 **Metrics:** http://localhost:3000/stats
 
-### Test with Example Clients
+### Try It: Example Clients
 
 Open multiple terminals to simulate real-time sync:
 
@@ -160,11 +140,11 @@ Watch as changes made in one client instantly appear in all others! 🎉
 
 ### Data Flow
 
-1. **Client Change** → Optimistic local update + send to server
-2. **Server Validates** → Conflict check via `sync_updated_at` timestamp
-3. **Server Persists** → MongoDB upsert/delete + audit log entry
-4. **Server Broadcasts** → Push to subscribed clients (filtered by FLX)
-5. **Clients Apply** → Merge with conflict resolution + update UI
+1) Client makes change (optimistic) → sends to server
+2) Server validates → resolves conflicts via `sync_updated_at`
+3) Server persists (MongoDB) → writes audit log
+4) Server broadcasts to subscribers
+5) Clients apply + update UI
 
 ## Project Structure
 
@@ -188,18 +168,18 @@ sync-implementation/
 
 ## 📋 Use Cases
 
-- **Mobile apps** requiring offline-first data sync (Flutter, React Native)
-- **Collaborative tools** with real-time multi-user editing
-- **IoT applications** with device-to-cloud synchronization
-- **Field service apps** with intermittent connectivity
-- **Chat applications** with message delivery guarantees
-- **Multi-tenant SaaS** with data partitioning via subscriptions
+- Offline-first mobile (Flutter/React Native)
+- Collaborative, multi-user apps
+- IoT device-to-cloud sync
+- Field service with spotty connectivity
+- Chats and activity feeds
+- Multi-tenant SaaS with scoped access
 
 ## 🎯 Key Concepts
 
 ### Conflict Resolution
 
-Uses **last-write-wins** strategy based on `sync_updated_at` timestamps (UTC milliseconds):
+Last-write-wins via `sync_updated_at` (UTC ms):
 
 ```typescript
 if (local.sync_updated_at >= remote.sync_updated_at) {
@@ -211,7 +191,7 @@ if (local.sync_updated_at >= remote.sync_updated_at) {
 
 ### Subscriptions (Flexible Sync)
 
-Filter server data using MongoDB-style queries:
+Filter server data with MongoDB-style queries:
 
 ```typescript
 // Client subscribes to only their own tasks
@@ -224,7 +204,7 @@ socket.emit('sync:subscribe', {
 
 ### Historical Sync
 
-Catch up on missed changes after going offline:
+Catch up after offline periods:
 
 ```typescript
 socket.emit('sync:get_changes', {
@@ -236,14 +216,14 @@ socket.emit('sync:get_changes', {
 
 ## 📡 API Reference
 
-### REST Endpoints
+### REST
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check with connection count |
-| `/ready` | GET | Readiness probe (checks MongoDB) |
-| `/stats` | GET | Server metrics and statistics |
-| `/api/negotiate?userId=<id>` | GET | Get Web PubSub access token |
+| `/health` | GET | Health check |
+| `/ready` | GET | Readiness probe (MongoDB) |
+| `/stats` | GET | Metrics & counters |
+| `/api/negotiate?userId=<id>` | GET | Web PubSub token |
 
 <details>
 <summary><b>Example Response: GET /stats</b></summary>
@@ -259,7 +239,7 @@ socket.emit('sync:get_changes', {
 ```
 </details>
 
-### Socket.IO Events
+### Socket.IO
 
 #### 🔼 Client → Server
 
@@ -366,7 +346,7 @@ socket.on('sync:changes', (changes) => {
 ```
 </details>
 
-## 💻 Client SDK Usage
+## 💻 Client SDK
 
 ### Basic Example
 
@@ -407,9 +387,9 @@ console.log('Last sync:', new Date(client.getLastSyncTimestamp()));
 await client.disconnect();
 ```
 
-### Flutter/Dart Integration
+### Flutter/Dart
 
-See the [Dart client SDK](../lib/services/RealmSync.dart) for Flutter/mobile integration with Realm Flutter.
+See the [Dart client SDK](../lib/services/RealmSync.dart) for Flutter integration.
 
 ```dart
 final realmSync = RealmSync(
@@ -509,7 +489,7 @@ Create `config/production.json` for environment-specific settings:
 }
 ```
 
-## 🚀 Production Deployment
+## 🚀 Deployment
 
 ### Build for Production
 
@@ -538,7 +518,7 @@ docker run -p 3000:3000 \
   realm-sync-server
 ```
 
-### Azure Deployment
+### Azure App Service
 
 <details>
 <summary><b>Deploy to Azure App Service</b></summary>
@@ -581,7 +561,7 @@ az webapp deployment source config-zip \
 ```
 </details>
 
-### Kubernetes Deployment
+### Kubernetes
 
 <details>
 <summary><b>Kubernetes manifests</b></summary>
@@ -645,7 +625,7 @@ spec:
 ```
 </details>
 
-### Azure Web PubSub Setup (for scaling)
+### Azure Web PubSub (scaling)
 
 ```bash
 # Create Web PubSub resource
@@ -770,7 +750,7 @@ Tested on Azure Standard_B2s (2 vCPU, 4 GB RAM):
 - **Horizontal**: Deploy multiple instances behind load balancer + Azure Web PubSub
 - **Database**: Use MongoDB Atlas auto-scaling or sharding
 
-## 🔒 Security Best Practices
+## 🔒 Security
 
 ### Production Checklist
 
@@ -822,7 +802,7 @@ git push origin feature/amazing-feature
 
 ## 📄 License
 
-MIT License - see [LICENSE](LICENSE) file for details
+MIT — see [LICENSE](LICENSE)
 
 ## 🙏 Acknowledgments
 
