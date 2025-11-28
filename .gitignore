@@ -3,6 +3,7 @@ dist/
 client/
 coverage/
 .env
+.env.test
 *.log
 .DS_Store
 .vscode/
