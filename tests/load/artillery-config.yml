@@ -1,0 +1,152 @@
+# Artillery Load Testing Configuration
+# Alternative to k6 - uses Node.js
+#
+# Install: npm install -g artillery
+# Run: artillery run tests/load/artillery-config.yml
+# Report: artillery run --output report.json tests/load/artillery-config.yml
+#         artillery report report.json
+
+config:
+  target: "http://localhost:3000"
+  phases:
+    # Warm up phase
+    - duration: 60
+      arrivalRate: 5
+      name: "Warm up - 5 users/sec"
+
+    # Ramp up phase
+    - duration: 120
+      arrivalRate: 5
+      rampTo: 50
+      name: "Ramp up - 5 to 50 users/sec"
+
+    # Sustained load
+    - duration: 300
+      arrivalRate: 50
+      name: "Sustained load - 50 users/sec"
+
+    # Spike test
+    - duration: 60
+      arrivalRate: 100
+      name: "Spike - 100 users/sec"
+
+    # Cool down
+    - duration: 60
+      arrivalRate: 10
+      name: "Cool down - 10 users/sec"
+
+  # Socket.IO configuration
+  socketio:
+    transports: ["websocket"]
+    upgrade: true
+
+  # Performance thresholds
+  ensure:
+    maxErrorRate: 5 # Max 5% error rate
+    p95: 2000 # 95th percentile under 2 seconds
+    p99: 5000 # 99th percentile under 5 seconds
+
+  # Plugins
+  plugins:
+    expect: {}
+    metrics-by-endpoint: {}
+
+  variables:
+    userId:
+      - "user-1"
+      - "user-2"
+      - "user-3"
+      - "user-4"
+      - "user-5"
+
+scenarios:
+  # Scenario 1: Typical realm-core sync pattern
+  - name: "Realm Sync Pattern"
+    weight: 70
+    flow:
+      # Health check
+      - get:
+          url: "/health"
+          expect:
+            - statusCode: 200
+            - contentType: json
+            - hasProperty: status
+
+      # Connect and sync via Socket.IO
+      - think: 1
+
+      # Simulate multiple changes
+      - loop:
+          - emit:
+              channel: "sync:change"
+              data:
+                id: "{{ $randomString() }}"
+                userId: "{{ userId }}"
+                timestamp: "{{ $timestamp }}"
+                operation: "insert"
+                collection: "RealmObject"
+                documentId: "doc-{{ $randomNumber(1, 1000) }}"
+                data:
+                  className: "Task"
+                  properties:
+                    name: "Task {{ $randomNumber(1, 100) }}"
+                    isComplete: false
+                    priority: "{{ $randomNumber(1, 5) }}"
+          - think: 0.5
+        count: 5
+
+      - think: 2
+
+  # Scenario 2: Bulk operations
+  - name: "Bulk Operations"
+    weight: 20
+    flow:
+      - get:
+          url: "/stats"
+          expect:
+            - statusCode: 200
+
+      - think: 1
+
+      # Send batch of changes
+      - emit:
+          channel: "sync:batch_changes"
+          data:
+            - id: "batch-1-{{ $randomString() }}"
+              userId: "{{ userId }}"
+              timestamp: "{{ $timestamp }}"
+              operation: "insert"
+              collection: "BulkTest"
+              documentId: "bulk-doc-1"
+              data: { index: 1 }
+            - id: "batch-2-{{ $randomString() }}"
+              userId: "{{ userId }}"
+              timestamp: "{{ $timestamp }}"
+              operation: "insert"
+              collection: "BulkTest"
+              documentId: "bulk-doc-2"
+              data: { index: 2 }
+            - id: "batch-3-{{ $randomString() }}"
+              userId: "{{ userId }}"
+              timestamp: "{{ $timestamp }}"
+              operation: "insert"
+              collection: "BulkTest"
+              documentId: "bulk-doc-3"
+              data: { index: 3 }
+
+  # Scenario 3: Read-heavy pattern
+  - name: "Read Heavy"
+    weight: 10
+    flow:
+      - emit:
+          channel: "sync:get_changes"
+          data:
+            userId: "{{ userId }}"
+            since: 0
+            limit: 100
+
+      - think: 3
+
+      - emit:
+          channel: "ping"
+          data: {}
