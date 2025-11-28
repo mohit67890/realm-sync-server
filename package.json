@@ -29,7 +29,7 @@
     "socket.io",
     "mongodb"
   ],
-  "author": "",
+  "author": "Mohit Garg",
   "license": "MIT",
   "dependencies": {
     "@azure/web-pubsub": "^1.1.2",

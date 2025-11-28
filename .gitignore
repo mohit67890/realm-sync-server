@@ -2,6 +2,7 @@ node_modules/
 dist/
 client/
 coverage/
+scripts/
 .env
 .env.test
 *.log
