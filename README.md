@@ -21,8 +21,10 @@ Real-time, offline-first sync for Realm-backed apps. Socket.IO + MongoDB with ti
 ### Prerequisites
 
 - Node.js 18+
-- MongoDB 5.0+ (local or Atlas)
-- Azure subscription (optional; for Web PubSub scaling)
+- MongoDB 5.0+ (local, Atlas, or **Azure Cosmos DB vCore**)
+- Azure subscription (optional; for Web PubSub scaling or Cosmos DB vCore)
+
+> **💡 Using Azure Cosmos DB vCore?** See [AZURE_COSMOS_VCORE.md](docs/AZURE_COSMOS_VCORE.md) for detailed setup, tuning, and migration guide.
 
 ### Installation
 
@@ -140,26 +142,90 @@ Watch as changes made in one client instantly appear in all others! 🎉
 
 ### Data Flow
 
-1) Client makes change (optimistic) → sends to server
-2) Server validates → resolves conflicts via `sync_updated_at`
-3) Server persists (MongoDB) → writes audit log
-4) Server broadcasts to subscribers
-5) Clients apply + update UI
+1. Client makes change (optimistic) → sends to server
+2. Server validates → resolves conflicts via `sync_updated_at`
+3. Server persists (MongoDB) → writes audit log
+4. Server broadcasts to subscribers
+5. Clients apply + update UI
+
+## 🧩 Extension System
+
+Extend the sync server with custom plugins! Add authentication, validation, analytics, notifications, and more without modifying core code.
+
+```typescript
+import { SyncServer } from "./server/sync-server";
+import { SyncServerPlugin } from "./extensions";
+
+const myPlugin: SyncServerPlugin = {
+  name: "my-plugin",
+  version: "1.0.0",
+
+  hooks: {
+    beforeChange: async (socket, change) => {
+      // Validate data before applying
+      if (!isValid(change.data)) {
+        throw new Error("Invalid data");
+      }
+    },
+
+    afterChange: async (socket, change) => {
+      // Send notification after change
+      await sendNotification(change);
+    },
+  },
+
+  customEvents: [
+    {
+      event: "custom:action",
+      handler: async (socket, data, callback) => {
+        // Handle custom event from client
+        callback?.({ success: true });
+      },
+    },
+  ],
+};
+
+const server = new SyncServer(...);
+server.registerPlugin(myPlugin);
+server.start();
+```
+
+**Available hooks:**
+
+- `beforeJoin`, `afterJoin` - User authentication lifecycle
+- `beforeChange`, `afterChange` - Data validation and processing
+- `beforeUpdateSubscriptions`, `afterUpdateSubscriptions` - Subscription management
+- `onDisconnect` - Cleanup on disconnect
+- `onServerStart`, `onServerStop` - Server lifecycle
+
+**📚 Full documentation:** [extensions/README.md](extensions/README.md)
+
+**Example plugins:** Audit logging, analytics, permissions, presence tracking, activity feeds, and more!
 
 ## Project Structure
 
 ```
 sync-implementation/
 ├── server/
-│   ├── index.ts          # Server entry point
-│   ├── sync-server.ts    # Main sync server logic
-│   └── database.ts       # MongoDB operations
+│   ├── index.ts                 # Server entry point
+│   ├── index-with-plugins.ts    # Example with plugins
+│   ├── sync-server.ts           # Main sync server logic
+│   └── database.ts              # MongoDB operations
+├── extensions/                   # 🆕 Plugin system
+│   ├── README.md                # Plugin development guide
+│   ├── plugin-types.ts          # Plugin interfaces
+│   ├── plugin-manager.ts        # Plugin orchestration
+│   └── examples/                # Example plugins
+│       ├── audit-logger.ts
+│       ├── analytics.ts
+│       ├── data-validation.ts
+│       └── notifications.ts
 ├── client/
-│   ├── sync-client.ts    # Client SDK
-│   └── example.ts        # Example usage
+│   ├── sync-client.ts           # Client SDK
+│   └── example.ts               # Example usage
 ├── shared/
-│   ├── types.ts          # Shared TypeScript types
-│   └── conflict-resolver.ts  # Conflict resolution strategies
+│   ├── types.ts                 # Shared TypeScript types
+│   └── conflict-resolver.ts     # Conflict resolution strategies
 ├── tests/
 │   ├── database.test.ts
 │   └── integration.test.ts
@@ -195,10 +261,10 @@ Filter server data with MongoDB-style queries:
 
 ```typescript
 // Client subscribes to only their own tasks
-socket.emit('sync:subscribe', {
-  collection: 'tasks',
-  filter: 'userId == $0',
-  args: [currentUserId]
+socket.emit("sync:subscribe", {
+  collection: "tasks",
+  filter: "userId == $0",
+  args: [currentUserId],
 });
 ```
 
@@ -207,10 +273,10 @@ socket.emit('sync:subscribe', {
 Catch up after offline periods:
 
 ```typescript
-socket.emit('sync:get_changes', {
-  collection: 'tasks',
+socket.emit("sync:get_changes", {
+  collection: "tasks",
   since: lastSyncTimestamp,
-  limit: 500
+  limit: 500,
 });
 ```
 
@@ -218,12 +284,12 @@ socket.emit('sync:get_changes', {
 
 ### REST
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/ready` | GET | Readiness probe (MongoDB) |
-| `/stats` | GET | Metrics & counters |
-| `/api/negotiate?userId=<id>` | GET | Web PubSub token |
+| Endpoint                     | Method | Description               |
+| ---------------------------- | ------ | ------------------------- |
+| `/health`                    | GET    | Health check              |
+| `/ready`                     | GET    | Readiness probe (MongoDB) |
+| `/stats`                     | GET    | Metrics & counters        |
+| `/api/negotiate?userId=<id>` | GET    | Web PubSub token          |
 
 <details>
 <summary><b>Example Response: GET /stats</b></summary>
@@ -237,6 +303,7 @@ socket.emit('sync:get_changes', {
   "activeUsers": ["user-1", "user-2", "user-3"]
 }
 ```
+
 </details>
 
 ### Socket.IO
@@ -247,13 +314,15 @@ socket.emit('sync:get_changes', {
 <summary><code>sync:join</code> - Join sync session</summary>
 
 ```typescript
-socket.emit('sync:join', 
-  { userId: 'user-123', token: 'jwt-token' }, 
+socket.emit(
+  "sync:join",
+  { userId: "user-123", token: "jwt-token" },
   (response) => {
     console.log(response); // { success: true, timestamp: 1234567890 }
   }
 );
 ```
+
 </details>
 
 <details>
@@ -261,17 +330,18 @@ socket.emit('sync:join',
 
 ```typescript
 const change = {
-  operation: 'update',
-  collection: 'tasks',
-  documentId: 'task-1',
-  data: { title: 'Updated', completed: true },
-  timestamp: Date.now()
+  operation: "update",
+  collection: "tasks",
+  documentId: "task-1",
+  data: { title: "Updated", completed: true },
+  timestamp: Date.now(),
 };
 
-socket.emit('sync:change', change, (ack) => {
+socket.emit("sync:change", change, (ack) => {
   console.log(ack); // { success: true, changeId: '...' }
 });
 ```
+
 </details>
 
 <details>
@@ -287,35 +357,42 @@ socket.emit('sync:changeBatch', {
   console.log(response.results); // Array of results per change
 });
 ```
+
 </details>
 
 <details>
 <summary><code>sync:subscribe</code> - Subscribe to filtered data</summary>
 
 ```typescript
-socket.emit('sync:subscribe', {
-  collection: 'tasks',
-  filter: 'userId == $0 AND status == $1',
-  args: ['user-123', 'active']
+socket.emit("sync:subscribe", {
+  collection: "tasks",
+  filter: "userId == $0 AND status == $1",
+  args: ["user-123", "active"],
 });
 ```
+
 </details>
 
 <details>
 <summary><code>sync:get_changes</code> - Fetch historical changes</summary>
 
 ```typescript
-socket.emit('sync:get_changes', {
-  userId: 'user-123',
-  collection: 'tasks',
-  since: 1234567890,
-  limit: 500
-}, (response) => {
-  console.log(response.changes.length);
-  console.log(response.latestTimestamp);
-  console.log(response.hasMore);
-});
+socket.emit(
+  "sync:get_changes",
+  {
+    userId: "user-123",
+    collection: "tasks",
+    since: 1234567890,
+    limit: 500,
+  },
+  (response) => {
+    console.log(response.changes.length);
+    console.log(response.latestTimestamp);
+    console.log(response.hasMore);
+  }
+);
 ```
+
 </details>
 
 #### 🔽 Server → Client
@@ -324,26 +401,28 @@ socket.emit('sync:get_changes', {
 <summary><code>sync:bootstrap</code> - Initial data load</summary>
 
 ```typescript
-socket.on('sync:bootstrap', (payload) => {
+socket.on("sync:bootstrap", (payload) => {
   console.log(payload.collection); // 'tasks'
-  console.log(payload.data);       // Array of documents
+  console.log(payload.data); // Array of documents
 });
 ```
+
 </details>
 
 <details>
 <summary><code>sync:changes</code> - Real-time change notifications</summary>
 
 ```typescript
-socket.on('sync:changes', (changes) => {
-  changes.forEach(change => {
-    console.log(change.operation);   // 'update' | 'delete'
-    console.log(change.collection);  // 'tasks'
+socket.on("sync:changes", (changes) => {
+  changes.forEach((change) => {
+    console.log(change.operation); // 'update' | 'delete'
+    console.log(change.collection); // 'tasks'
     console.log(change.documentId);
     console.log(change.data);
   });
 });
 ```
+
 </details>
 
 ## 💻 Client SDK
@@ -351,37 +430,37 @@ socket.on('sync:changes', (changes) => {
 ### Basic Example
 
 ```typescript
-import { SyncClient } from './client/sync-client';
+import { SyncClient } from "./client/sync-client";
 
 // Initialize client
 const client = new SyncClient(
-  'http://localhost:3000',              // Server URL
-  'user-123',                            // User ID
-  'mongodb://localhost:27017/myapp'     // Local MongoDB (for offline queue)
+  "http://localhost:3000", // Server URL
+  "user-123", // User ID
+  "mongodb://localhost:27017/myapp" // Local MongoDB (for offline queue)
 );
 
 await client.initialize();
 await client.connect();
 
 // Make changes (automatically synced)
-await client.makeChange('insert', 'tasks', 'task-1', {
-  title: 'Buy groceries',
+await client.makeChange("insert", "tasks", "task-1", {
+  title: "Buy groceries",
   completed: false,
-  userId: 'user-123',
-  sync_updated_at: Date.now()
+  userId: "user-123",
+  sync_updated_at: Date.now(),
 });
 
-await client.makeChange('update', 'tasks', 'task-1', {
+await client.makeChange("update", "tasks", "task-1", {
   completed: true,
-  sync_updated_at: Date.now()
+  sync_updated_at: Date.now(),
 });
 
-await client.makeChange('delete', 'tasks', 'task-1');
+await client.makeChange("delete", "tasks", "task-1");
 
 // Monitor connection
-console.log('Online:', client.isOnline());
-console.log('Pending:', client.getPendingChangesCount());
-console.log('Last sync:', new Date(client.getLastSyncTimestamp()));
+console.log("Online:", client.isOnline());
+console.log("Pending:", client.getPendingChangesCount());
+console.log("Last sync:", new Date(client.getLastSyncTimestamp()));
 
 // Cleanup
 await client.disconnect();
@@ -451,21 +530,21 @@ tests/
 
 ### Environment Variables
 
-| Variable | Description | Required | Default |
-|----------|-------------|----------|---------|
-| `MONGODB_URI` | MongoDB connection string | ✅ Yes | - |
-| `WEB_PUBSUB_CONNECTION_STRING` | Azure Web PubSub connection | ⚠️ Production | - |
-| `WEB_PUBSUB_HUB_NAME` | Web PubSub hub name | ⚠️ Production | `Hub` |
-| `PORT` | Server HTTP port | ❌ No | `3000` |
-| `NODE_ENV` | Environment mode | ❌ No | `development` |
-| `AUTH_JWT_SECRET` | JWT signing secret | ⚠️ Production | - |
-| `MAX_CONNECTIONS_PER_USER` | Connection limit per user | ❌ No | `10` (prod), `100` (dev) |
-| `MAX_CONNECTIONS_PER_IP` | Connection limit per IP | ❌ No | `50` (prod), `500` (dev) |
-| `SYNC_RATE_LIMIT_MAX` | Max changes per window | ❌ No | `50` |
-| `SYNC_RATE_LIMIT_WINDOW_MS` | Rate limit window (ms) | ❌ No | `10000` |
-| `RATE_LIMIT_DISABLED` | Disable rate limiting | ❌ No | `false` |
-| `LOG_LEVEL` | Logging verbosity | ❌ No | `info` |
-| `ALLOWED_ORIGINS` | CORS allowed origins (comma-separated) | ⚠️ Production | `*` (dev) |
+| Variable                       | Description                            | Required      | Default                  |
+| ------------------------------ | -------------------------------------- | ------------- | ------------------------ |
+| `MONGODB_URI`                  | MongoDB connection string              | ✅ Yes        | -                        |
+| `WEB_PUBSUB_CONNECTION_STRING` | Azure Web PubSub connection            | ⚠️ Production | -                        |
+| `WEB_PUBSUB_HUB_NAME`          | Web PubSub hub name                    | ⚠️ Production | `Hub`                    |
+| `PORT`                         | Server HTTP port                       | ❌ No         | `3000`                   |
+| `NODE_ENV`                     | Environment mode                       | ❌ No         | `development`            |
+| `AUTH_JWT_SECRET`              | JWT signing secret                     | ⚠️ Production | -                        |
+| `MAX_CONNECTIONS_PER_USER`     | Connection limit per user              | ❌ No         | `10` (prod), `100` (dev) |
+| `MAX_CONNECTIONS_PER_IP`       | Connection limit per IP                | ❌ No         | `50` (prod), `500` (dev) |
+| `SYNC_RATE_LIMIT_MAX`          | Max changes per window                 | ❌ No         | `50`                     |
+| `SYNC_RATE_LIMIT_WINDOW_MS`    | Rate limit window (ms)                 | ❌ No         | `10000`                  |
+| `RATE_LIMIT_DISABLED`          | Disable rate limiting                  | ❌ No         | `false`                  |
+| `LOG_LEVEL`                    | Logging verbosity                      | ❌ No         | `info`                   |
+| `ALLOWED_ORIGINS`              | CORS allowed origins (comma-separated) | ⚠️ Production | `*` (dev)                |
 
 ### Advanced Configuration
 
@@ -559,6 +638,7 @@ az webapp deployment source config-zip \
   --resource-group realm-sync-rg \
   --src dist.zip
 ```
+
 </details>
 
 ### Kubernetes
@@ -582,33 +662,33 @@ spec:
         app: realm-sync
     spec:
       containers:
-      - name: server
-        image: realm-sync-server:latest
-        ports:
-        - containerPort: 3000
-        env:
-        - name: MONGODB_URI
-          valueFrom:
-            secretKeyRef:
-              name: sync-secrets
-              key: mongodb-uri
-        - name: AUTH_JWT_SECRET
-          valueFrom:
-            secretKeyRef:
-              name: sync-secrets
-              key: jwt-secret
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 3000
-          initialDelaySeconds: 10
-          periodSeconds: 30
-        readinessProbe:
-          httpGet:
-            path: /ready
-            port: 3000
-          initialDelaySeconds: 5
-          periodSeconds: 10
+        - name: server
+          image: realm-sync-server:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: sync-secrets
+                  key: mongodb-uri
+            - name: AUTH_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sync-secrets
+                  key: jwt-secret
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -618,11 +698,12 @@ spec:
   selector:
     app: realm-sync
   ports:
-  - protocol: TCP
-    port: 80
-    targetPort: 3000
+    - protocol: TCP
+      port: 80
+      targetPort: 3000
   type: LoadBalancer
 ```
+
 </details>
 
 ### Azure Web PubSub (scaling)
@@ -710,6 +791,7 @@ curl http://localhost:3000/stats | jq '.activeConnections'
 ### Optimization Tips
 
 1. **Database Indexes**: Create compound indexes on `sync_updated_at` and collection-specific fields
+
    ```javascript
    db.tasks.createIndex({ sync_updated_at: 1, userId: 1 });
    ```
@@ -717,11 +799,13 @@ curl http://localhost:3000/stats | jq '.activeConnections'
 2. **Batch Operations**: Use `sync:changeBatch` for bulk updates (10x faster than individual changes)
 
 3. **Connection Pooling**: Configure MongoDB pool size based on concurrent users
+
    ```
    MONGODB_URI=mongodb://...?maxPoolSize=50
    ```
 
 4. **Rate Limiting**: Adjust limits based on your use case
+
    ```bash
    SYNC_RATE_LIMIT_MAX=100          # Higher for power users
    SYNC_RATE_LIMIT_WINDOW_MS=5000   # Shorter window for stricter limits
@@ -736,19 +820,44 @@ curl http://localhost:3000/stats | jq '.activeConnections'
 
 Tested on Azure Standard_B2s (2 vCPU, 4 GB RAM):
 
-| Metric | Value |
-|--------|-------|
-| Concurrent connections | 1,000+ |
-| Changes per second | 5,000+ |
-| Average latency | <50ms |
-| Memory per connection | ~1MB |
+| Metric                   | Value        |
+| ------------------------ | ------------ |
+| Concurrent connections   | 1,000+       |
+| Changes per second       | 5,000+       |
+| Average latency          | <50ms        |
+| Memory per connection    | ~1MB         |
 | MongoDB write throughput | 10,000 ops/s |
 
 ### Scaling Strategy
 
 - **Vertical**: Increase server resources (CPU/RAM)
 - **Horizontal**: Deploy multiple instances behind load balancer + Azure Web PubSub
-- **Database**: Use MongoDB Atlas auto-scaling or sharding
+- **Database**: Use MongoDB Atlas auto-scaling or Azure Cosmos DB vCore sharding
+
+#### Azure Cosmos DB MongoDB vCore
+
+For Azure-native deployments, Cosmos DB vCore provides:
+
+- **Native MongoDB compatibility** (wire protocol 5.0+)
+- **Full feature support**: Change streams, TTL indexes, transactions
+- **Integrated scaling**: Auto-scale compute and storage independently
+- **Cost-effective**: Pay per vCore + storage (no RU complexity)
+- **Performance tiers**: M25 (2 vCores, $108/mo) → M50 (8 vCores, $434/mo) → M80+ for enterprise
+
+**When to use vCore:**
+
+- Need Azure-native integration (VNets, Private Link, Azure AD)
+- Want predictable pricing (vCore-hours vs. RU/s spikes)
+- Require 99.995% SLA with zone redundancy
+- Multi-region reads with local latency (<10ms)
+
+**Connection string format:**
+
+```bash
+mongodb://username:password@cluster-name.mongocluster.cosmos.azure.com:10255/?tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false&maxIdleTimeMS=120000
+```
+
+**Recommended starting tier:** M25 (2 vCores) handles 1-5K concurrent users (~$108/month)
 
 ## 🔒 Security
 

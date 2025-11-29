@@ -8,7 +8,24 @@ export class Database {
   private subscriptionsCollection: Collection<any> | null = null;
 
   constructor(private uri: string) {
-    this.client = new MongoClient(uri);
+    // Azure Cosmos DB vCore optimizations
+    const options: any = {
+      maxPoolSize: parseInt(process.env.DB_MAX_POOL_SIZE || "100", 10),
+      minPoolSize: parseInt(process.env.DB_MIN_POOL_SIZE || "10", 10),
+      maxIdleTimeMS: 120000, // Keep connections alive for 2 minutes
+      retryWrites: false, // vCore doesn't support retryable writes yet
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+    };
+
+    // If using Azure Cosmos DB vCore, ensure proper TLS and auth
+    if (uri.includes("mongocluster.cosmos.azure.com")) {
+      options.tls = true;
+      options.authMechanism = "SCRAM-SHA-256";
+      console.log("🔷 Detected Azure Cosmos DB MongoDB vCore connection");
+    }
+
+    this.client = new MongoClient(uri, options);
   }
 
   async connect(): Promise<void> {
@@ -59,6 +76,11 @@ export class Database {
       userId: 1,
       "subscriptions.id": 1,
     });
+    // TTL index: auto-delete subscriptions after 90 days of inactivity
+    await this.subscriptionsCollection.createIndex(
+      { updatedAt: 1 },
+      { expireAfterSeconds: 90 * 24 * 60 * 60 }
+    );
     // Idempotency: ensure unique change IDs (skip in test environment for simpler fixtures)
     if (process.env.NODE_ENV !== "test") {
       try {
@@ -301,6 +323,20 @@ export class Database {
     return result.deletedCount;
   }
 
+  async cleanupInactiveSubscriptions(
+    inactiveDays: number = 90
+  ): Promise<number> {
+    if (!this.subscriptionsCollection)
+      throw new Error("Database not connected");
+
+    const cutoffTimestamp = Date.now() - inactiveDays * 24 * 60 * 60 * 1000;
+    const result = await this.subscriptionsCollection.deleteMany({
+      updatedAt: { $lt: cutoffTimestamp },
+    });
+
+    return result.deletedCount;
+  }
+
   async getStats(): Promise<any> {
     if (!this.changesCollection) throw new Error("Database not connected");
 
@@ -366,6 +402,15 @@ export class Database {
     if (!this.subscriptionsCollection)
       throw new Error("Database not connected");
     return await this.subscriptionsCollection.findOne({ userId });
+  }
+
+  async touchSubscriptionSet(userId: string): Promise<void> {
+    if (!this.subscriptionsCollection)
+      throw new Error("Database not connected");
+    await this.subscriptionsCollection.updateOne(
+      { userId },
+      { $set: { updatedAt: Date.now() } }
+    );
   }
 
   async updateSubscriptionState(

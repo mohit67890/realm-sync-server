@@ -13,6 +13,8 @@ import {
   BootstrapData,
 } from "../shared/types";
 import { QueryTranslator } from "./query-translator";
+import { PluginManager } from "../extensions/plugin-manager";
+import { SyncServerPlugin } from "../extensions/plugin-types";
 
 export class SyncServer {
   private app: express.Application;
@@ -44,6 +46,7 @@ export class SyncServer {
       : true;
   private readonly version = process.env.APP_VERSION || "dev";
   private mongoUri: string;
+  private pluginManager: PluginManager;
 
   constructor(
     mongoUri: string,
@@ -66,6 +69,7 @@ export class SyncServer {
     this.mongoUri = mongoUri;
     this.db = new Database(mongoUri);
     this.queryTranslator = new QueryTranslator();
+    this.pluginManager = new PluginManager();
     this.webPubSubClient = new WebPubSubServiceClient(
       webPubSubConnectionString,
       hubName
@@ -81,6 +85,20 @@ export class SyncServer {
     }
   }
 
+  /**
+   * Register a plugin to extend server functionality
+   */
+  registerPlugin(plugin: SyncServerPlugin): void {
+    this.pluginManager.registerPlugin(plugin);
+  }
+
+  /**
+   * Get the plugin manager instance (for advanced use cases)
+   */
+  getPluginManager(): PluginManager {
+    return this.pluginManager;
+  }
+
   async start(): Promise<void> {
     // Production configuration enforcement
     if (process.env.NODE_ENV === "production" && !process.env.AUTH_JWT_SECRET) {
@@ -90,9 +108,23 @@ export class SyncServer {
       throw new Error("Missing AUTH_JWT_SECRET in production environment");
     }
     await this.db.connect();
+
+    // Initialize plugins
+    await this.pluginManager.initialize({
+      app: this.app as any,
+      io: this.io,
+      db: this.db,
+      activeConnections: this.activeConnections,
+      userSubscriptions: this.userSubscriptions,
+      version: this.version,
+    });
+
     this.setupRoutes();
     this.setupAuthMiddleware();
     this.setupSocketHandlers();
+
+    // Register custom event handlers from plugins
+    this.registerPluginEventHandlers();
 
     this.httpServer.listen(this.port, () => {
       const redactedUri = this.mongoUri.replace(
@@ -112,6 +144,9 @@ export class SyncServer {
       console.log(`✅ Ready:  http://localhost:${this.port}/ready`);
       console.log("==========================================");
     });
+
+    // Execute plugin onServerStart hooks
+    await this.pluginManager.executeOnServerStart();
 
     // Schedule periodic cleanup of old changes (daily)
     this.cleanupInterval = setInterval(
@@ -213,6 +248,41 @@ export class SyncServer {
     });
   }
 
+  private registerPluginEventHandlers(): void {
+    const customHandlers = this.pluginManager.getCustomEventHandlers();
+
+    for (const handler of customHandlers) {
+      this.io.on("connection", (socket) => {
+        socket.on(handler.event, async (data: any, callback?: any) => {
+          try {
+            // Optional rate limiting for custom events
+            if (
+              handler.rateLimit &&
+              !this.checkRateLimit(socket, handler.rateLimit)
+            ) {
+              if (callback) {
+                callback({ success: false, error: "rate_limit_exceeded" });
+              }
+              return;
+            }
+
+            await handler.handler(socket, data, callback);
+          } catch (error: any) {
+            console.error(
+              `❌ Error in custom event handler ${handler.event}:`,
+              error
+            );
+            if (callback) {
+              callback({ success: false, error: String(error) });
+            }
+          }
+        });
+      });
+
+      console.log(`🔌 Registered custom event handler: ${handler.event}`);
+    }
+  }
+
   private setupAuthMiddleware(): void {
     if (process.env.AUTH_JWT_SECRET) {
       this.io.use((socket, next) => {
@@ -287,6 +357,20 @@ export class SyncServer {
               return;
             }
 
+            // Execute beforeJoin hooks (can reject by throwing)
+            try {
+              await this.pluginManager.executeBeforeJoin(socket, userId);
+            } catch (error: any) {
+              console.error(`❌ Plugin rejected join for ${userId}:`, error);
+              if (callback) {
+                return callback({
+                  success: false,
+                  error: `Join rejected: ${error.message}`,
+                });
+              }
+              return;
+            }
+
             // Check per-user connection limit (skip in test/development)
             const userConnections = this.activeConnections.get(userId);
             if (
@@ -317,12 +401,18 @@ export class SyncServer {
             const subscriptionSet = await this.db.getSubscriptionSet(userId);
             if (subscriptionSet) {
               this.userSubscriptions.set(userId, subscriptionSet);
+              // Touch updatedAt to keep active subscriptions alive (prevents TTL deletion)
+              await this.db.touchSubscriptionSet(userId);
               console.log(
                 `📋 Loaded ${subscriptionSet.subscriptions?.length || 0} subscriptions for user ${userId}`
               );
             }
 
             console.log(`✅ User ${userId} joined (socket: ${socket.id})`);
+
+            // Execute afterJoin hooks
+            await this.pluginManager.executeAfterJoin(socket, userId);
+
             if (callback) {
               callback({ success: true, timestamp: Date.now() });
             }
@@ -351,6 +441,13 @@ export class SyncServer {
 
             console.log(`📋 Updating subscriptions for user ${userId}`);
 
+            // Execute beforeUpdateSubscriptions hooks
+            await this.pluginManager.executeBeforeUpdateSubscriptions(
+              socket,
+              userId,
+              request.subscriptions
+            );
+
             // Save subscription set to database
             const version = await this.db.saveSubscriptionSet(
               userId,
@@ -372,6 +469,13 @@ export class SyncServer {
                 );
               }
             }
+
+            // Execute afterUpdateSubscriptions hooks
+            await this.pluginManager.executeAfterUpdateSubscriptions(
+              socket,
+              userId,
+              version
+            );
 
             if (callback) {
               callback({
@@ -461,7 +565,7 @@ export class SyncServer {
 
         try {
           const timestamp = Date.now();
-          const changeRecord: Change = {
+          let changeRecord: Change = {
             ...change,
             timestamp,
             synced: false,
@@ -470,6 +574,15 @@ export class SyncServer {
           console.log(
             `📝 Processing change: ${change.operation} on ${change.collection}/${change.documentId}`
           );
+
+          // Execute beforeChange hooks (can modify or reject change)
+          const modifiedChange = await this.pluginManager.executeBeforeChange(
+            socket,
+            changeRecord
+          );
+          if (modifiedChange) {
+            changeRecord = modifiedChange;
+          }
 
           // Save to change log
           await this.db.saveChange(changeRecord);
@@ -522,6 +635,9 @@ export class SyncServer {
 
           const latency = Date.now() - startTime;
           console.log(`✅ Change applied in ${latency}ms`);
+
+          // Execute afterChange hooks
+          await this.pluginManager.executeAfterChange(socket, changeRecord);
 
           // Acknowledge to sender
           const ack: ChangeAck = {
@@ -577,7 +693,7 @@ export class SyncServer {
           delete normalizedData.patchId;
           delete normalizedData.id; // documentId already represented
           // Build Change record
-          const change: Change = {
+          let change: Change = {
             id: changeId,
             userId,
             timestamp: Date.now(),
@@ -587,6 +703,22 @@ export class SyncServer {
             data: normalizedData,
             synced: false,
           };
+
+          // Execute beforeChange hooks (can modify or reject change)
+          try {
+            const modifiedChange = await this.pluginManager.executeBeforeChange(
+              socket,
+              change
+            );
+            if (modifiedChange) {
+              change = modifiedChange;
+            }
+          } catch (error: any) {
+            console.error(`❌ Plugin rejected mongoUpsert:`, error);
+            if (callback) callback("error");
+            return;
+          }
+
           // Reuse existing logic path
           await this.db.saveChange(change);
           const applyResult = await this.db.applyChange(change);
@@ -630,6 +762,10 @@ export class SyncServer {
           console.log(
             `✅ mongoUpsert applied ${collection}/${queryId} in ${latency}ms`
           );
+
+          // Execute afterChange hooks
+          await this.pluginManager.executeAfterChange(socket, change);
+
           if (callback) callback("ok");
         } catch (e) {
           console.error("❌ mongoUpsert error", e);
@@ -650,7 +786,7 @@ export class SyncServer {
             payload?.patchId ||
             `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
           const userId: string = socket.data.userId || "anonymous";
-          const change: Change = {
+          let change: Change = {
             id: changeId,
             userId,
             timestamp: Date.now(),
@@ -659,6 +795,22 @@ export class SyncServer {
             documentId: id,
             synced: false,
           };
+
+          // Execute beforeChange hooks (can reject delete)
+          try {
+            const modifiedChange = await this.pluginManager.executeBeforeChange(
+              socket,
+              change
+            );
+            if (modifiedChange) {
+              change = modifiedChange;
+            }
+          } catch (error: any) {
+            console.error(`❌ Plugin rejected mongoDelete:`, error);
+            if (callback) callback("error");
+            return;
+          }
+
           await this.db.saveChange(change);
           const applyResult = await this.db.applyChange(change);
           if (!applyResult.applied && applyResult.conflict) {
@@ -688,6 +840,10 @@ export class SyncServer {
             }
           });
           console.log(`✅ mongoDelete applied ${collection}/${id}`);
+
+          // Execute afterChange hooks
+          await this.pluginManager.executeAfterChange(socket, change);
+
           if (callback) callback("ok");
         } catch (e) {
           console.error("❌ mongoDelete error", e);
@@ -741,7 +897,7 @@ export class SyncServer {
 
               if (operation === "delete") {
                 // Handle delete operation
-                const changeRecord: Change = {
+                let changeRecord: Change = {
                   id: changeId,
                   userId,
                   timestamp: Date.now(),
@@ -750,6 +906,24 @@ export class SyncServer {
                   documentId,
                   synced: false,
                 };
+
+                // Execute beforeChange hooks
+                try {
+                  const modifiedChange = await this.pluginManager.executeBeforeChange(
+                    socket,
+                    changeRecord
+                  );
+                  if (modifiedChange) {
+                    changeRecord = modifiedChange;
+                  }
+                } catch (error: any) {
+                  results.push({
+                    success: false,
+                    documentId,
+                    error: `Plugin rejected: ${error.message}`,
+                  });
+                  continue;
+                }
 
                 await this.db.saveChange(changeRecord);
                 const applyResult = await this.db.applyChange(changeRecord);
@@ -765,6 +939,9 @@ export class SyncServer {
                         .emit("sync:changes", [changeRecord]);
                     }
                   }
+
+                  // Execute afterChange hooks
+                  await this.pluginManager.executeAfterChange(socket, changeRecord);
 
                   results.push({
                     success: true,
@@ -780,7 +957,7 @@ export class SyncServer {
                 }
               } else {
                 // Handle upsert operation
-                const changeRecord: Change = {
+                let changeRecord: Change = {
                   id: changeId,
                   userId,
                   timestamp: data?.sync_updated_at || Date.now(),
@@ -790,6 +967,24 @@ export class SyncServer {
                   data: data || {},
                   synced: false,
                 };
+
+                // Execute beforeChange hooks
+                try {
+                  const modifiedChange = await this.pluginManager.executeBeforeChange(
+                    socket,
+                    changeRecord
+                  );
+                  if (modifiedChange) {
+                    changeRecord = modifiedChange;
+                  }
+                } catch (error: any) {
+                  results.push({
+                    success: false,
+                    documentId,
+                    error: `Plugin rejected: ${error.message}`,
+                  });
+                  continue;
+                }
 
                 await this.db.saveChange(changeRecord);
                 const applyResult = await this.db.applyChange(changeRecord);
@@ -805,6 +1000,9 @@ export class SyncServer {
                         .emit("sync:changes", [changeRecord]);
                     }
                   }
+
+                  // Execute afterChange hooks
+                  await this.pluginManager.executeAfterChange(socket, changeRecord);
 
                   results.push({
                     success: true,
@@ -862,15 +1060,36 @@ export class SyncServer {
         for (const change of changes) {
           try {
             const timestamp = Date.now();
-            const changeRecord: Change = {
+            let changeRecord: Change = {
               ...change,
               timestamp,
               synced: false,
             };
 
+            // Execute beforeChange hooks (can modify or reject change)
+            try {
+              const modifiedChange = await this.pluginManager.executeBeforeChange(
+                socket,
+                changeRecord
+              );
+              if (modifiedChange) {
+                changeRecord = modifiedChange;
+              }
+            } catch (error: any) {
+              results.push({
+                changeId: change.id,
+                success: false,
+                error: `Plugin rejected: ${error.message}`,
+              });
+              continue;
+            }
+
             await this.db.saveChange(changeRecord);
             await this.db.applyChange(changeRecord);
             await this.db.markChangeSynced(changeRecord.id);
+
+            // Execute afterChange hooks
+            await this.pluginManager.executeAfterChange(socket, changeRecord);
 
             results.push({
               changeId: change.id,
@@ -1038,9 +1257,12 @@ export class SyncServer {
       });
 
       // Handle disconnect
-      socket.on("disconnect", () => {
+      socket.on("disconnect", async () => {
         const userId = socket.data.userId;
         const clientIp = socket.handshake.address;
+
+        // Execute onDisconnect hooks
+        await this.pluginManager.executeOnDisconnect(socket, userId);
 
         // Cleanup IP connection tracking
         const ipCount = this.ipConnections.get(clientIp) || 0;
@@ -1057,9 +1279,20 @@ export class SyncServer {
             if (connections.size === 0) {
               this.activeConnections.delete(userId);
 
-              // Clean up user subscriptions to prevent memory leak
-              this.userSubscriptions.delete(userId);
-              console.log(`✅ Cleaned up subscriptions for user: ${userId}`);
+              // Schedule memory cleanup after 5 minutes of inactivity
+              // This allows quick reconnects without reloading subscriptions from DB
+              setTimeout(
+                () => {
+                  // Check if user reconnected during timeout
+                  if (!this.activeConnections.has(userId)) {
+                    this.userSubscriptions.delete(userId);
+                    console.log(
+                      `🧹 Cleared subscription cache for inactive user: ${userId}`
+                    );
+                  }
+                },
+                5 * 60 * 1000
+              );
             }
           }
         }
@@ -1074,12 +1307,25 @@ export class SyncServer {
     try {
       const deletedCount = await this.db.cleanupOldChanges(30);
       console.log(`🧹 Cleaned up ${deletedCount} old changes`);
+
+      // Also cleanup inactive subscriptions (TTL index handles this automatically,
+      // but manual cleanup ensures it works even without TTL support)
+      const deletedSubs = await this.db.cleanupInactiveSubscriptions(90);
+      if (deletedSubs > 0) {
+        console.log(`🧹 Cleaned up ${deletedSubs} inactive subscriptions`);
+      }
     } catch (error) {
-      console.error("Error cleaning up old changes:", error);
+      console.error("Error cleaning up old data:", error);
     }
   }
 
   async stop(): Promise<void> {
+    // Execute onServerStop hooks
+    await this.pluginManager.executeOnServerStop();
+
+    // Cleanup plugins
+    await this.pluginManager.cleanup();
+
     this.io.close();
     await this.db.close();
     if (this.cleanupInterval) {
