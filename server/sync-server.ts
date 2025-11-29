@@ -47,6 +47,7 @@ export class SyncServer {
   private readonly version = process.env.APP_VERSION || "dev";
   private mongoUri: string;
   private pluginManager: PluginManager;
+  private broadcastToSender: boolean;
 
   constructor(
     mongoUri: string,
@@ -83,6 +84,8 @@ export class SyncServer {
       const v = parseInt(process.env.SYNC_RATE_LIMIT_WINDOW_MS, 10);
       if (!isNaN(v) && v > 0) this.rateWindowMs = v;
     }
+    // Configure whether to broadcast changes back to sender
+    this.broadcastToSender = process.env.BROADCAST_TO_SENDER === "true";
   }
 
   /**
@@ -610,13 +613,17 @@ export class SyncServer {
           // Mark as synced (only if successfully applied)
           await this.db.markChangeSynced(changeRecord.id);
 
-          // FLX-aware broadcast: emit to ALL users with matching subscriptions (including sender)
+          // FLX-aware broadcast: emit to users with matching subscriptions
           // Emit directly to socket IDs to ensure all clients receive changes
           for (const userId of this.activeConnections.keys()) {
             if (this.shouldReceiveChange(userId, changeRecord)) {
               const socketIds = this.activeConnections.get(userId);
               if (socketIds) {
                 socketIds.forEach((socketId) => {
+                  // Skip sender if BROADCAST_TO_SENDER is false
+                  if (!this.broadcastToSender && socketId === socket.id) {
+                    return;
+                  }
                   this.io.to(socketId).emit("sync:changes", [changeRecord]);
                 });
               }
@@ -740,6 +747,10 @@ export class SyncServer {
                   `  ✅ Emitting to user ${userIdKey} (${socketIds.size} socket(s)): ${Array.from(socketIds).join(", ")}`
                 );
                 socketIds.forEach((socketId) => {
+                  // Skip sender if BROADCAST_TO_SENDER is false
+                  if (!this.broadcastToSender && socketId === socket.id) {
+                    return;
+                  }
                   this.io.to(socketId).emit("sync:changes", [change]);
                 });
               }
@@ -825,6 +836,10 @@ export class SyncServer {
               const socketIds = this.activeConnections.get(userIdKey);
               if (socketIds) {
                 socketIds.forEach((socketId) => {
+                  // Skip sender if BROADCAST_TO_SENDER is false
+                  if (!this.broadcastToSender && socketId === socket.id) {
+                    return;
+                  }
                   this.io.to(socketId).emit("sync:changes", [change]);
                 });
               }
@@ -934,9 +949,16 @@ export class SyncServer {
                   // Broadcast to all matching users
                   for (const userIdKey of this.activeConnections.keys()) {
                     if (this.shouldReceiveChange(userIdKey, changeRecord)) {
-                      this.io
-                        .to(`user:${userIdKey}`)
-                        .emit("sync:changes", [changeRecord]);
+                      const socketIds = this.activeConnections.get(userIdKey);
+                      if (socketIds) {
+                        socketIds.forEach((socketId) => {
+                          // Skip sender if BROADCAST_TO_SENDER is false
+                          if (!this.broadcastToSender && socketId === socket.id) {
+                            return;
+                          }
+                          this.io.to(socketId).emit("sync:changes", [changeRecord]);
+                        });
+                      }
                     }
                   }
 
@@ -995,9 +1017,16 @@ export class SyncServer {
                   // Broadcast to all matching users
                   for (const userIdKey of this.activeConnections.keys()) {
                     if (this.shouldReceiveChange(userIdKey, changeRecord)) {
-                      this.io
-                        .to(`user:${userIdKey}`)
-                        .emit("sync:changes", [changeRecord]);
+                      const socketIds = this.activeConnections.get(userIdKey);
+                      if (socketIds) {
+                        socketIds.forEach((socketId) => {
+                          // Skip sender if BROADCAST_TO_SENDER is false
+                          if (!this.broadcastToSender && socketId === socket.id) {
+                            return;
+                          }
+                          this.io.to(socketId).emit("sync:changes", [changeRecord]);
+                        });
+                      }
                     }
                   }
 
@@ -1117,6 +1146,10 @@ export class SyncServer {
               const socketIds = this.activeConnections.get(userId);
               if (socketIds) {
                 socketIds.forEach((socketId) => {
+                  // Skip sender if BROADCAST_TO_SENDER is false
+                  if (!this.broadcastToSender && socketId === socket.id) {
+                    return;
+                  }
                   this.io.to(socketId).emit("sync:changes", filtered);
                 });
               }
