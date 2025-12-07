@@ -22,9 +22,11 @@ export interface SyncRequest {
 }
 
 export interface SyncResponse {
-  changes: Change[];
+  changes?: Change[]; // Optional: changes sent via individual emits to stay under 1MB
   latestTimestamp: number;
   hasMore: boolean;
+  count?: number; // Number of changes sent (when changes not included in response)
+  error?: string; // Error message if request failed
 }
 
 export interface ChangeAck {

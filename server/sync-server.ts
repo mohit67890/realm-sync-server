@@ -1,8 +1,10 @@
 import express from "express";
 import { createServer } from "http";
 import { Server, Socket } from "socket.io";
-import jwt from "jsonwebtoken";
 import { WebPubSubServiceClient } from "@azure/web-pubsub";
+
+import { useAzureSocketIO } from "@azure/web-pubsub-socket.io";
+
 import { Database } from "./database";
 import {
   Change,
@@ -13,8 +15,36 @@ import {
   BootstrapData,
 } from "../shared/types";
 import { QueryTranslator } from "./query-translator";
+import { SyncServerRoutes, RouteSetupFunction, RouteContext } from "./routes";
 import { PluginManager } from "../extensions/plugin-manager";
 import { SyncServerPlugin } from "../extensions/plugin-types";
+import { SubscriptionMatcher } from "../shared/subscription-matcher";
+// Auth helper: derive userId from authenticated socket or fallback
+function getUserIdFromSocket(
+  socket: Socket,
+  fallbackUserId?: string
+): string | undefined {
+  // If USE_USERID is true, use socket.id as userId
+  if (process.env.USE_USERID === "true") {
+    return socket.id;
+  }
+
+  if (socket?.data?.userId) return socket.data.userId;
+  if (socket?.handshake.query.uuid)
+    return socket.handshake.query.uuid as string;
+  if (socket?.handshake.query.userId)
+    return socket.handshake.query.userId as string;
+  return fallbackUserId;
+}
+
+import {
+  AuthManager,
+  AuthStrategy,
+  createJWTProviderFromEnv,
+  createFirebaseProviderFromEnv,
+} from "../shared/auth-index";
+import { convertDatesToNative } from "../shared/utils";
+import fs from "fs";
 
 export class SyncServer {
   private app: express.Application;
@@ -28,6 +58,7 @@ export class SyncServer {
   private rateLimits = new Map<string, number[]>(); // socketId -> timestamps (ms)
   private ipConnections = new Map<string, number>(); // IP -> connection count
   private cleanupInterval: NodeJS.Timeout | null = null;
+  private subscriptionMatcher: SubscriptionMatcher;
   private maxChangesPerWindow = 50; // configurable threshold
   private rateWindowMs = 10_000; // 10s window
   private maxConnectionsPerUser = parseInt(
@@ -37,6 +68,11 @@ export class SyncServer {
   private maxConnectionsPerIp = parseInt(
     process.env.MAX_CONNECTIONS_PER_IP ||
       (process.env.NODE_ENV === "production" ? "50" : "500")
+  );
+  // Limit the number of documents sent during initial FLX bootstrap per subscription
+  private bootstrapLimit = parseInt(
+    process.env.SUBSCRIPTION_BOOTSTRAP_LIMIT || "1000",
+    10
   );
   private rateLimitingEnabled =
     process.env.RATE_LIMIT_DISABLED === "1" ||
@@ -48,24 +84,41 @@ export class SyncServer {
   private mongoUri: string;
   private pluginManager: PluginManager;
   private broadcastToSender: boolean;
+  private authManager: AuthManager;
+  private customRouteSetup?: RouteSetupFunction;
+  // Azure Pub Sub has a 1MB message limit, so we cap at 900KB for safety
+  private maxMessageSize = parseInt(
+    process.env.MAX_MESSAGE_SIZE || "921600", // 900KB default
+    10
+  );
 
   constructor(
     mongoUri: string,
     webPubSubConnectionString: string,
     hubName: string,
-    private port: number = 3000
+    private port: number = 3000,
+    authManager: AuthManager
   ) {
+    this.authManager = authManager;
     this.app = express();
     this.httpServer = createServer(this.app);
     this.io = new Server(this.httpServer, {
+      allowUpgrades: false,
+
+      maxHttpBufferSize: 1e6, // 1MB
       cors: {
         origin:
           process.env.NODE_ENV === "production"
             ? process.env.ALLOWED_ORIGINS?.split(",") || false
             : "*",
+        methods: ["GET", "POST"],
+        allowedHeaders: ["authorization"],
         credentials: true,
       },
-      transports: ["websocket", "polling"],
+      transports: ["websocket"],
+      connectionStateRecovery: {
+        maxDisconnectionDuration: 1000,
+      },
     });
     this.mongoUri = mongoUri;
     this.db = new Database(mongoUri);
@@ -75,6 +128,13 @@ export class SyncServer {
       webPubSubConnectionString,
       hubName
     );
+    // Initialize subscription matcher with configuration
+    this.subscriptionMatcher = new SubscriptionMatcher({
+      userSubscriptions: this.userSubscriptions,
+      activeConnections: this.activeConnections,
+      queryTranslator: this.queryTranslator,
+      io: this.io,
+    });
     // Allow env overrides for rate limiting configuration
     if (process.env.SYNC_RATE_LIMIT_MAX) {
       const v = parseInt(process.env.SYNC_RATE_LIMIT_MAX, 10);
@@ -102,15 +162,53 @@ export class SyncServer {
     return this.pluginManager;
   }
 
+  /**
+   * Set custom route setup function for extending HTTP endpoints
+   */
+  setCustomRoutes(setupFunction: RouteSetupFunction): void {
+    this.customRouteSetup = setupFunction;
+  }
+
+  /**
+   * Get route context for custom route setup
+   */
+  private getRouteContext(): RouteContext {
+    return {
+      app: this.app as any,
+      db: this.db,
+      webPubSubClient: this.webPubSubClient,
+      version: this.version,
+      activeConnections: this.activeConnections,
+      userSubscriptions: this.userSubscriptions,
+      io: this.io,
+      queryTranslator: this.queryTranslator,
+      broadcastToSender: this.broadcastToSender,
+    };
+  }
+
   async start(): Promise<void> {
-    // Production configuration enforcement
-    if (process.env.NODE_ENV === "production" && !process.env.AUTH_JWT_SECRET) {
-      console.error(
-        "❌ FATAL: AUTH_JWT_SECRET is required in production for secure identity."
-      );
-      throw new Error("Missing AUTH_JWT_SECRET in production environment");
+    // Enforce provider-based auth: require at least one enabled provider
+    const providers = this.authManager.getEnabledProviders();
+    if (!providers.length) {
+      const msg = "No auth providers enabled; configure at least one provider.";
+      if (process.env.NODE_ENV === "production") {
+        console.error(`❌ FATAL (production): ${msg}`);
+        throw new Error(msg);
+      } else {
+        console.warn(`⚠️ ${msg}`);
+      }
     }
     await this.db.connect();
+
+    if (
+      process.env.WEB_PUBSUB_HUB_NAME != null &&
+      process.env.WEB_PUBSUB_CONNECTION_STRING != null
+    ) {
+      await useAzureSocketIO(this.io, {
+        hub: process.env.WEB_PUBSUB_HUB_NAME, // The hub name can be any valid string.
+        connectionString: process.env.WEB_PUBSUB_CONNECTION_STRING,
+      });
+    }
 
     // Initialize plugins
     await this.pluginManager.initialize({
@@ -137,7 +235,10 @@ export class SyncServer {
       console.log("==========================================");
       console.log("✅ Sync Server Started");
       console.log(`📦 Version: ${this.version}`);
-      console.log(`🛡 JWT Auth Enabled: ${!!process.env.AUTH_JWT_SECRET}`);
+      const enabledProviders = this.authManager.getEnabledProviders();
+      console.log(
+        `🔐 Auth Providers: ${enabledProviders.join(", ") || "none"}`
+      );
       console.log(`🌐 Port: ${this.port}`);
       console.log(`🗄 MongoDB: ${redactedUri}`);
       console.log(
@@ -177,78 +278,15 @@ export class SyncServer {
   private setupRoutes(): void {
     this.app.use(express.json());
 
-    this.app.get("/health", (req, res) => {
-      res.json({
-        status: "healthy",
-        timestamp: Date.now(),
-        activeConnections: this.activeConnections.size,
-        version: this.version,
-      });
-    });
+    // Setup default routes (health, ready, stats, negotiate)
+    const context = this.getRouteContext();
+    SyncServerRoutes.setupDefaultRoutes(context);
 
-    this.app.get("/ready", (req, res) => {
-      const ready = this.db.isConnected();
-      if (!ready) {
-        return res
-          .status(503)
-          .json({ status: "starting", version: this.version });
-      }
-      res.json({ status: "ready", version: this.version });
-    });
-
-    this.app.get("/stats", async (req, res) => {
-      try {
-        const stats = await this.db.getStats();
-        res.json({
-          ...stats,
-          activeConnections: this.activeConnections.size,
-          activeUsers: Array.from(this.activeConnections.keys()),
-        });
-      } catch (error: any) {
-        res.status(500).json({ error: error.message });
-      }
-    });
-
-    // Endpoint to get Web PubSub access token + optional JWT for socket auth
-    this.app.get("/api/negotiate", async (req, res) => {
-      try {
-        let userId: string | undefined;
-        const authHeader = req.headers.authorization;
-        if (
-          authHeader &&
-          authHeader.startsWith("Bearer ") &&
-          process.env.AUTH_JWT_SECRET
-        ) {
-          const raw = authHeader.substring(7);
-          try {
-            const payload: any = jwt.verify(raw, process.env.AUTH_JWT_SECRET);
-            userId = payload.sub || payload.userId;
-          } catch (e: any) {
-            return res.status(401).json({ error: "Invalid token" });
-          }
-        } else {
-          // Backwards compatibility fallback
-          userId = (req.query.userId as string) || undefined;
-        }
-        if (!userId) {
-          return res.status(400).json({ error: "Missing user identity" });
-        }
-        const token = await this.webPubSubClient.getClientAccessToken({
-          userId,
-          roles: ["webpubsub.sendToGroup", "webpubsub.joinLeaveGroup"],
-        });
-        let jwtToken: string | undefined;
-        if (process.env.AUTH_JWT_SECRET) {
-          jwtToken = jwt.sign({ sub: userId }, process.env.AUTH_JWT_SECRET, {
-            expiresIn: "15m",
-          });
-        }
-        res.json({ url: token.url, token: token.token, jwt: jwtToken });
-      } catch (error: any) {
-        console.error("Error generating token:", error);
-        res.status(500).json({ error: "Failed to generate token" });
-      }
-    });
+    // Setup custom routes if provided
+    if (this.customRouteSetup) {
+      console.log("🔧 Setting up custom routes");
+      this.customRouteSetup(context);
+    }
   }
 
   private registerPluginEventHandlers(): void {
@@ -287,24 +325,46 @@ export class SyncServer {
   }
 
   private setupAuthMiddleware(): void {
-    if (process.env.AUTH_JWT_SECRET) {
-      this.io.use((socket, next) => {
-        const token = socket.handshake.auth?.token as string | undefined;
-        if (!token) {
-          return next(new Error("auth_token_missing"));
-        }
+    // Custom middleware to override socket.id with userId when USE_USERID=true
+    if (process.env.USE_USERID === "true") {
+      this.io.use(async (socket, next) => {
         try {
-          const payload: any = jwt.verify(token, process.env.AUTH_JWT_SECRET!);
-          socket.data.userId = payload.sub || payload.userId;
+          // Extract userId from various sources
+          const uuid = socket.handshake.query.uuid as string | undefined;
+          const userId = socket.handshake.query.userId as string | undefined;
+
+          // Use uuid or userId from query parameters
+          if (uuid) {
+            // Override socket.id by modifying the internal property
+            (socket as any).id = uuid;
+            socket.data.userId = uuid;
+            console.log(`🔑 Socket ID overridden with uuid: ${uuid}`);
+            return next();
+          }
+
+          if (userId) {
+            // Override socket.id by modifying the internal property
+            (socket as any).id = userId;
+            socket.data.userId = userId;
+            console.log(`🔑 Socket ID overridden with userId: ${userId}`);
+            return next();
+          }
+
+          // If no uuid/userId provided, keep original socket.id
+          socket.data.userId = socket.id;
+          console.log(`🔑 Using original socket.id as userId: ${socket.id}`);
           return next();
-        } catch (e: any) {
-          return next(new Error("auth_token_invalid"));
+        } catch (err) {
+          console.error("Socket ID override error:", err);
+          return next();
         }
       });
-      console.log("🔐 JWT socket auth middleware enabled");
-    } else {
-      console.log("⚠️ JWT auth not enabled (no AUTH_JWT_SECRET)");
     }
+
+    // Use multi-provider auth system
+    this.io.use(this.authManager.createMiddleware());
+    const enabledProviders = this.authManager.getEnabledProviders();
+    console.log(`🔐 Auth Providers: ${enabledProviders.join(", ") || "none"}`);
   }
 
   private setupSocketHandlers(): void {
@@ -336,26 +396,26 @@ export class SyncServer {
       // Handle authentication and room joining
       socket.on(
         "sync:join",
-        async (data: { userId?: string; token?: string }, callback?) => {
+        async (
+          data: { userId?: string; token?: string; subscriptions?: any[] },
+          callback?
+        ) => {
           try {
-            // When auth secret enabled, userId must come from middleware
-            let userId: string | undefined = socket.data.userId;
-            if (!process.env.AUTH_JWT_SECRET) {
-              // fallback legacy path
-              userId = data.userId;
-              // Set it on socket.data so other handlers can use it
-              if (userId) {
-                socket.data.userId = userId;
-              }
+            // Extract userId using auth module (handles both JWT and legacy mode)
+            let userId = getUserIdFromSocket(socket, data.userId);
+
+            // If USE_USERID is true, always use socket.id as userId
+            if (process.env.USE_USERID === "true") {
+              userId = socket.id;
+            }
+
+            // Set it on socket.data for consistency
+            if (userId && !socket.data.userId) {
+              socket.data.userId = userId;
             }
             if (!userId) {
               if (callback) {
-                return callback({
-                  success: false,
-                  error: process.env.AUTH_JWT_SECRET
-                    ? "unauthenticated"
-                    : "userId required",
-                });
+                return callback({ success: false, error: "unauthenticated" });
               }
               return;
             }
@@ -400,15 +460,101 @@ export class SyncServer {
             }
             this.activeConnections.get(userId)!.add(socket.id);
 
-            // Load existing subscriptions from database
-            const subscriptionSet = await this.db.getSubscriptionSet(userId);
-            if (subscriptionSet) {
-              this.userSubscriptions.set(userId, subscriptionSet);
-              // Touch updatedAt to keep active subscriptions alive (prevents TTL deletion)
-              await this.db.touchSubscriptionSet(userId);
+            // Process subscriptions sent with sync:join (NEW: supports FLX subscriptions in join payload)
+            let subscriptionVersion: number | undefined;
+            if (
+              data.subscriptions &&
+              Array.isArray(data.subscriptions) &&
+              data.subscriptions.length > 0
+            ) {
               console.log(
-                `📋 Loaded ${subscriptionSet.subscriptions?.length || 0} subscriptions for user ${userId}`
+                `📋 [sync:join] Client sent ${data.subscriptions.length} subscriptions in join payload for userId=${userId}`
               );
+
+              // Execute beforeUpdateSubscriptions hooks
+              await this.pluginManager.executeBeforeUpdateSubscriptions(
+                socket,
+                userId,
+                data.subscriptions
+              );
+
+              // Save subscription set to database
+              subscriptionVersion = await this.db.saveSubscriptionSet(
+                userId,
+                data.subscriptions
+              );
+              console.log(
+                `✅ [sync:join] Saved ${data.subscriptions.length} subscriptions with version=${subscriptionVersion} for userId=${userId}`
+              );
+
+              // Store in memory for fast filtering
+              const subscriptionSet = await this.db.getSubscriptionSet(userId);
+              this.userSubscriptions.set(userId, subscriptionSet);
+              console.log(
+                `✅ [sync:join] Stored subscriptions in memory for userId=${userId}, total users in map: ${this.userSubscriptions.size}`
+              );
+
+              // Bootstrap each subscription with initial data
+              for (const sub of data.subscriptions) {
+                try {
+                  await this.bootstrapSubscription(socket, userId, sub);
+                } catch (error) {
+                  console.error(
+                    `Failed to bootstrap subscription ${sub.name || sub.collection}:`,
+                    error
+                  );
+                }
+              }
+
+              // Execute afterUpdateSubscriptions hooks
+              await this.pluginManager.executeAfterUpdateSubscriptions(
+                socket,
+                userId,
+                subscriptionVersion
+              );
+            } else {
+              // No subscriptions in join payload - load existing from database (backward compatibility)
+              console.log(
+                `🔍 [sync:join] No subscriptions in payload, loading from DB for userId=${userId}`
+              );
+              const subscriptionSet = await this.db.getSubscriptionSet(userId);
+              console.log(
+                `🔍 [sync:join] getSubscriptionSet result for userId=${userId}:`,
+                subscriptionSet
+                  ? `Found ${subscriptionSet.subscriptions?.length || 0} subscriptions (version ${subscriptionSet.version})`
+                  : "NULL/UNDEFINED"
+              );
+
+              // Always store in map, even if null/empty, to mark user as having joined
+              // This prevents shouldReceiveChange from always returning true (broadcast-all fallback)
+              if (subscriptionSet) {
+                this.userSubscriptions.set(userId, subscriptionSet);
+                console.log(
+                  `✅ [sync:join] Stored subscriptions in memory for userId=${userId}, total users in map: ${this.userSubscriptions.size}`
+                );
+                // Touch updatedAt to keep active subscriptions alive (prevents TTL deletion)
+                await this.db.touchSubscriptionSet(userId);
+                console.log(
+                  `📋 Loaded ${subscriptionSet.subscriptions?.length || 0} subscriptions for user ${userId}`
+                );
+                subscriptionVersion = subscriptionSet.version;
+              } else {
+                // Store empty subscription set to indicate user has joined but has no filters
+                const emptySet = {
+                  userId,
+                  version: 0,
+                  subscriptions: [],
+                  updatedAt: Date.now(),
+                };
+                this.userSubscriptions.set(userId, emptySet);
+                console.log(
+                  `✅ [sync:join] Created empty subscription set for userId=${userId}, total users in map: ${this.userSubscriptions.size}`
+                );
+                console.log(
+                  `📋 No subscriptions found for user ${userId} - using broadcast-all behavior`
+                );
+                subscriptionVersion = 0;
+              }
             }
 
             console.log(`✅ User ${userId} joined (socket: ${socket.id})`);
@@ -417,14 +563,34 @@ export class SyncServer {
             await this.pluginManager.executeAfterJoin(socket, userId);
 
             if (callback) {
-              callback({ success: true, timestamp: Date.now() });
+              const response = await this.processCallback(
+                socket,
+                "sync:join",
+                {
+                  success: true,
+                  timestamp: Date.now(),
+                  subscriptionVersion: subscriptionVersion,
+                },
+                data
+              );
+              callback(response);
             }
             // Also emit a joined event for clients that don't support callbacks
-            socket.emit("joined", { userId, timestamp: Date.now() });
+            socket.emit("joined", {
+              userId,
+              timestamp: Date.now(),
+              subscriptionVersion,
+            });
           } catch (error: any) {
             console.error("Error joining:", error);
             if (callback) {
-              callback({ success: false, error: String(error) });
+              const response = await this.processCallback(
+                socket,
+                "sync:join",
+                { success: false, error: String(error) },
+                data
+              );
+              callback(response);
             }
           }
         }
@@ -452,14 +618,29 @@ export class SyncServer {
             );
 
             // Save subscription set to database
+            console.log(
+              `🔍 [sync:update_subscriptions] Saving ${request.subscriptions.length} subscriptions for userId=${userId}`
+            );
             const version = await this.db.saveSubscriptionSet(
               userId,
               request.subscriptions
             );
+            console.log(
+              `✅ [sync:update_subscriptions] Saved subscriptions with version=${version} for userId=${userId}`
+            );
 
             // Store in memory for fast filtering
             const subscriptionSet = await this.db.getSubscriptionSet(userId);
+            console.log(
+              `🔍 [sync:update_subscriptions] Retrieved subscriptionSet from DB:`,
+              subscriptionSet
+                ? `Found ${subscriptionSet.subscriptions?.length || 0} subscriptions (version ${subscriptionSet.version})`
+                : "NULL/UNDEFINED"
+            );
             this.userSubscriptions.set(userId, subscriptionSet);
+            console.log(
+              `✅ [sync:update_subscriptions] Stored in memory for userId=${userId}, total users in map: ${this.userSubscriptions.size}`
+            );
 
             // Bootstrap each subscription with initial data
             for (const sub of request.subscriptions) {
@@ -481,11 +662,17 @@ export class SyncServer {
             );
 
             if (callback) {
-              callback({
-                success: true,
-                version,
-                timestamp: Date.now(),
-              });
+              const response = await this.processCallback(
+                socket,
+                "sync:update_subscriptions",
+                {
+                  success: true,
+                  version,
+                  timestamp: Date.now(),
+                },
+                request
+              );
+              callback(response);
             }
 
             console.log(
@@ -494,7 +681,13 @@ export class SyncServer {
           } catch (error: any) {
             console.error("Error updating subscriptions:", error);
             if (callback) {
-              callback({ success: false, error: String(error) });
+              const response = await this.processCallback(
+                socket,
+                "sync:update_subscriptions",
+                { success: false, error: String(error) },
+                request
+              );
+              callback(response);
             }
           }
         }
@@ -568,8 +761,14 @@ export class SyncServer {
 
         try {
           const timestamp = Date.now();
+          // Convert ISO-8601 date strings and wrapped dates to native Date objects
+          const convertedData = change.data
+            ? convertDatesToNative(change.data)
+            : undefined;
+
           let changeRecord: Change = {
             ...change,
+            data: convertedData,
             timestamp,
             synced: false,
           };
@@ -616,29 +815,34 @@ export class SyncServer {
           // FLX-aware broadcast: emit to users with matching subscriptions
           // Emit directly to socket IDs to ensure all clients receive changes
           for (const userId of this.activeConnections.keys()) {
-            if (this.shouldReceiveChange(userId, changeRecord)) {
+            const matchResult = this.subscriptionMatcher.shouldReceiveChange(
+              userId,
+              changeRecord
+            );
+            if (matchResult.shouldReceive) {
               const socketIds = this.activeConnections.get(userId);
               if (socketIds) {
-                socketIds.forEach((socketId) => {
+                socketIds.forEach(async (socketId) => {
                   // Skip sender if BROADCAST_TO_SENDER is false
                   if (!this.broadcastToSender && socketId === socket.id) {
                     return;
                   }
-                  this.io.to(socketId).emit("sync:changes", [changeRecord]);
+                  // Apply broadcast processor hook
+                  let processedChange = changeRecord;
+                  const modifiedChange =
+                    await this.pluginManager.executeBroadcastProcessor(
+                      socket,
+                      changeRecord,
+                      userId
+                    );
+                  if (modifiedChange) {
+                    processedChange = modifiedChange;
+                  }
+                  this.io.to(socketId).emit("sync:changes", [processedChange]);
                 });
               }
             }
           }
-
-          // Transient per-socket subscriptions: emit to individual sockets that match
-          this.io.sockets.sockets.forEach((s) => {
-            if (
-              s.id !== socket.id &&
-              this.matchesTransientSubscription(s, changeRecord)
-            ) {
-              s.emit("sync:changes", [changeRecord]);
-            }
-          });
 
           const latency = Date.now() - startTime;
           console.log(`✅ Change applied in ${latency}ms`);
@@ -652,7 +856,13 @@ export class SyncServer {
             success: true,
             timestamp,
           };
-          callback(ack);
+          const response = await this.processCallback(
+            socket,
+            "sync:change",
+            ack,
+            change
+          );
+          callback(response);
         } catch (error: any) {
           console.error("❌ Error processing change:", error);
           const ack: ChangeAck = {
@@ -660,7 +870,13 @@ export class SyncServer {
             success: false,
             error: String(error),
           };
-          callback(ack);
+          const response = await this.processCallback(
+            socket,
+            "sync:change",
+            ack,
+            change
+          );
+          callback(response);
         }
       });
 
@@ -684,18 +900,9 @@ export class SyncServer {
             `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
           const userId: string =
             socket.data.userId || update.userId || "anonymous";
-          // Convert wrapped dates {type:'date',value:iso} -> iso/Date number
-          const normalizedData: any = { ...update };
-          for (const k of Object.keys(normalizedData)) {
-            const v = normalizedData[k];
-            if (v && typeof v === "object" && v.type === "date" && v.value) {
-              // Store as sync_updated_at for internal conflict resolution, also keep original field
-              if (k === "updatedAt") {
-                normalizedData.sync_updated_at = Date.parse(v.value);
-              }
-              normalizedData[k] = v.value;
-            }
-          }
+          // Convert ISO-8601 date strings and wrapped dates to native Date objects
+          const normalizedData = convertDatesToNative({ ...update });
+
           // Remove client-only metadata
           delete normalizedData.patchId;
           delete normalizedData.id; // documentId already represented
@@ -740,18 +947,33 @@ export class SyncServer {
             `📡 Broadcasting mongoUpsert change to active users: ${Array.from(this.activeConnections.keys()).join(", ")}`
           );
           for (const userIdKey of this.activeConnections.keys()) {
-            if (this.shouldReceiveChange(userIdKey, change)) {
+            const matchResult = this.subscriptionMatcher.shouldReceiveChange(
+              userIdKey,
+              change
+            );
+            if (matchResult.shouldReceive) {
               const socketIds = this.activeConnections.get(userIdKey);
               if (socketIds) {
                 console.log(
                   `  ✅ Emitting to user ${userIdKey} (${socketIds.size} socket(s)): ${Array.from(socketIds).join(", ")}`
                 );
-                socketIds.forEach((socketId) => {
+                socketIds.forEach(async (socketId) => {
                   // Skip sender if BROADCAST_TO_SENDER is false
                   if (!this.broadcastToSender && socketId === socket.id) {
                     return;
                   }
-                  this.io.to(socketId).emit("sync:changes", [change]);
+                  // Apply broadcast processor hook
+                  let processedChange = change;
+                  const modifiedChange =
+                    await this.pluginManager.executeBroadcastProcessor(
+                      socket,
+                      change,
+                      userIdKey
+                    );
+                  if (modifiedChange) {
+                    processedChange = modifiedChange;
+                  }
+                  this.io.to(socketId).emit("sync:changes", [processedChange]);
                 });
               }
             } else {
@@ -760,15 +982,7 @@ export class SyncServer {
               );
             }
           }
-          // Transient subscriptions broadcast
-          this.io.sockets.sockets.forEach((s) => {
-            if (
-              s.id !== socket.id &&
-              this.matchesTransientSubscription(s, change)
-            ) {
-              s.emit("sync:changes", [change]);
-            }
-          });
+
           const latency = Date.now() - startTime;
           console.log(
             `✅ mongoUpsert applied ${collection}/${queryId} in ${latency}ms`
@@ -777,19 +991,37 @@ export class SyncServer {
           // Execute afterChange hooks
           await this.pluginManager.executeAfterChange(socket, change);
 
-          if (callback) callback("ok");
+          if (callback) {
+            const response = await this.processCallback(
+              socket,
+              "mongoUpsert",
+              "ok",
+              payload
+            );
+            callback(response);
+          }
         } catch (e) {
           console.error("❌ mongoUpsert error", e);
-          if (callback) callback("error");
+          if (callback) {
+            const response = await this.processCallback(
+              socket,
+              "mongoUpsert",
+              "error",
+              payload
+            );
+            callback(response);
+          }
         }
       });
 
       // Compatibility handler for Dart client mongoDelete payloads
       socket.on("mongoDelete", async (payload: any, callback?) => {
         try {
+          const startTime = Date.now();
           const collection = payload?.collection;
           const id = payload?.query?._id;
           if (!collection || !id) {
+            console.warn(`⚠️ mongoDelete: Missing collection or id`);
             if (callback) callback("error");
             return;
           }
@@ -807,6 +1039,10 @@ export class SyncServer {
             synced: false,
           };
 
+          console.log(
+            `🗑️ Processing mongoDelete: ${collection}/${id} by user ${userId}`
+          );
+
           // Execute beforeChange hooks (can reject delete)
           try {
             const modifiedChange = await this.pluginManager.executeBeforeChange(
@@ -818,51 +1054,106 @@ export class SyncServer {
             }
           } catch (error: any) {
             console.error(`❌ Plugin rejected mongoDelete:`, error);
-            if (callback) callback("error");
+            if (callback) {
+              const response = await this.processCallback(
+                socket,
+                "mongoDelete",
+                { success: false, error: error.message },
+                payload
+              );
+              callback(response);
+            }
             return;
           }
 
           await this.db.saveChange(change);
           const applyResult = await this.db.applyChange(change);
+
           if (!applyResult.applied && applyResult.conflict) {
             await this.db.markChangeSynced(change.id);
-            if (callback) callback("error");
+            console.warn(
+              `⚠️ mongoDelete conflict for ${collection}/${id}: ${applyResult.conflict.reason}`
+            );
+            if (callback) {
+              const response = await this.processCallback(
+                socket,
+                "mongoDelete",
+                {
+                  success: false,
+                  error: "conflict",
+                  conflict: applyResult.conflict,
+                },
+                payload
+              );
+              callback(response);
+            }
             return;
           }
+
           await this.db.markChangeSynced(change.id);
+
           // Broadcast delete to all matching users - emit directly to socket IDs
+          console.log(
+            `📡 Broadcasting mongoDelete to active users: ${Array.from(this.activeConnections.keys()).join(", ")}`
+          );
           for (const userIdKey of this.activeConnections.keys()) {
-            if (this.shouldReceiveChange(userIdKey, change)) {
+            const matchResult = this.subscriptionMatcher.shouldReceiveChange(
+              userIdKey,
+              change
+            );
+            if (matchResult.shouldReceive) {
               const socketIds = this.activeConnections.get(userIdKey);
               if (socketIds) {
-                socketIds.forEach((socketId) => {
+                socketIds.forEach(async (socketId) => {
                   // Skip sender if BROADCAST_TO_SENDER is false
                   if (!this.broadcastToSender && socketId === socket.id) {
                     return;
                   }
-                  this.io.to(socketId).emit("sync:changes", [change]);
+                  // Apply broadcast processor hook
+                  let processedChange = change;
+                  const modifiedChange =
+                    await this.pluginManager.executeBroadcastProcessor(
+                      socket,
+                      change,
+                      userIdKey
+                    );
+                  if (modifiedChange) {
+                    processedChange = modifiedChange;
+                  }
+                  this.io.to(socketId).emit("sync:changes", [processedChange]);
                 });
               }
             }
           }
-          // Transient subscriptions broadcast
-          this.io.sockets.sockets.forEach((s) => {
-            if (
-              s.id !== socket.id &&
-              this.matchesTransientSubscription(s, change)
-            ) {
-              s.emit("sync:changes", [change]);
-            }
-          });
-          console.log(`✅ mongoDelete applied ${collection}/${id}`);
+
+          const latency = Date.now() - startTime;
+          console.log(
+            `✅ mongoDelete applied ${collection}/${id} in ${latency}ms - document deleted from MongoDB`
+          );
 
           // Execute afterChange hooks
           await this.pluginManager.executeAfterChange(socket, change);
 
-          if (callback) callback("ok");
+          if (callback) {
+            const response = await this.processCallback(
+              socket,
+              "mongoDelete",
+              { success: true },
+              payload
+            );
+            callback(response);
+          }
         } catch (e) {
           console.error("❌ mongoDelete error", e);
-          if (callback) callback("error");
+          if (callback) {
+            const response = await this.processCallback(
+              socket,
+              "mongoDelete",
+              { success: false, error: String(e) },
+              payload
+            );
+            callback(response);
+          }
         }
       });
 
@@ -924,10 +1215,11 @@ export class SyncServer {
 
                 // Execute beforeChange hooks
                 try {
-                  const modifiedChange = await this.pluginManager.executeBeforeChange(
-                    socket,
-                    changeRecord
-                  );
+                  const modifiedChange =
+                    await this.pluginManager.executeBeforeChange(
+                      socket,
+                      changeRecord
+                    );
                   if (modifiedChange) {
                     changeRecord = modifiedChange;
                   }
@@ -951,19 +1243,38 @@ export class SyncServer {
                     if (this.shouldReceiveChange(userIdKey, changeRecord)) {
                       const socketIds = this.activeConnections.get(userIdKey);
                       if (socketIds) {
-                        socketIds.forEach((socketId) => {
+                        socketIds.forEach(async (socketId) => {
                           // Skip sender if BROADCAST_TO_SENDER is false
-                          if (!this.broadcastToSender && socketId === socket.id) {
+                          if (
+                            !this.broadcastToSender &&
+                            socketId === socket.id
+                          ) {
                             return;
                           }
-                          this.io.to(socketId).emit("sync:changes", [changeRecord]);
+                          // Apply broadcast processor hook
+                          let processedChange = changeRecord;
+                          const modifiedChange =
+                            await this.pluginManager.executeBroadcastProcessor(
+                              socket,
+                              changeRecord,
+                              userIdKey
+                            );
+                          if (modifiedChange) {
+                            processedChange = modifiedChange;
+                          }
+                          this.io
+                            .to(socketId)
+                            .emit("sync:changes", [processedChange]);
                         });
                       }
                     }
                   }
 
                   // Execute afterChange hooks
-                  await this.pluginManager.executeAfterChange(socket, changeRecord);
+                  await this.pluginManager.executeAfterChange(
+                    socket,
+                    changeRecord
+                  );
 
                   results.push({
                     success: true,
@@ -979,6 +1290,9 @@ export class SyncServer {
                 }
               } else {
                 // Handle upsert operation
+                // Convert ISO-8601 date strings and wrapped dates to native Date objects
+                const convertedData = convertDatesToNative(data || {});
+
                 let changeRecord: Change = {
                   id: changeId,
                   userId,
@@ -986,16 +1300,17 @@ export class SyncServer {
                   operation: "update",
                   collection: collectionName,
                   documentId,
-                  data: data || {},
+                  data: convertedData,
                   synced: false,
                 };
 
                 // Execute beforeChange hooks
                 try {
-                  const modifiedChange = await this.pluginManager.executeBeforeChange(
-                    socket,
-                    changeRecord
-                  );
+                  const modifiedChange =
+                    await this.pluginManager.executeBeforeChange(
+                      socket,
+                      changeRecord
+                    );
                   if (modifiedChange) {
                     changeRecord = modifiedChange;
                   }
@@ -1019,19 +1334,38 @@ export class SyncServer {
                     if (this.shouldReceiveChange(userIdKey, changeRecord)) {
                       const socketIds = this.activeConnections.get(userIdKey);
                       if (socketIds) {
-                        socketIds.forEach((socketId) => {
+                        socketIds.forEach(async (socketId) => {
                           // Skip sender if BROADCAST_TO_SENDER is false
-                          if (!this.broadcastToSender && socketId === socket.id) {
+                          if (
+                            !this.broadcastToSender &&
+                            socketId === socket.id
+                          ) {
                             return;
                           }
-                          this.io.to(socketId).emit("sync:changes", [changeRecord]);
+                          // Apply broadcast processor hook
+                          let processedChange = changeRecord;
+                          const modifiedChange =
+                            await this.pluginManager.executeBroadcastProcessor(
+                              socket,
+                              changeRecord,
+                              userIdKey
+                            );
+                          if (modifiedChange) {
+                            processedChange = modifiedChange;
+                          }
+                          this.io
+                            .to(socketId)
+                            .emit("sync:changes", [processedChange]);
                         });
                       }
                     }
                   }
 
                   // Execute afterChange hooks
-                  await this.pluginManager.executeAfterChange(socket, changeRecord);
+                  await this.pluginManager.executeAfterChange(
+                    socket,
+                    changeRecord
+                  );
 
                   results.push({
                     success: true,
@@ -1059,17 +1393,31 @@ export class SyncServer {
           );
 
           if (callback) {
-            callback({
-              success: true,
-              results,
-              totalProcessed: changes.length,
-              successCount,
-              latency,
-            });
+            const response = await this.processCallback(
+              socket,
+              "sync:changeBatch",
+              {
+                success: true,
+                results,
+                totalProcessed: changes.length,
+                successCount,
+                latency,
+              },
+              payload
+            );
+            callback(response);
           }
         } catch (e) {
           console.error("❌ changeBatch error", e);
-          if (callback) callback({ success: false, error: String(e) });
+          if (callback) {
+            const response = await this.processCallback(
+              socket,
+              "sync:changeBatch",
+              { success: false, error: String(e) },
+              payload
+            );
+            callback(response);
+          }
         }
       });
 
@@ -1097,10 +1445,11 @@ export class SyncServer {
 
             // Execute beforeChange hooks (can modify or reject change)
             try {
-              const modifiedChange = await this.pluginManager.executeBeforeChange(
-                socket,
-                changeRecord
-              );
+              const modifiedChange =
+                await this.pluginManager.executeBeforeChange(
+                  socket,
+                  changeRecord
+                );
               if (modifiedChange) {
                 changeRecord = modifiedChange;
               }
@@ -1135,38 +1484,46 @@ export class SyncServer {
         }
 
         // FLX-aware broadcast for batch changes - emit directly to socket IDs
+        // Use individual emits to stay under Azure Pub Sub 1MB limit
         const successfulChanges = changes.filter((_, i) => results[i].success);
         if (successfulChanges.length > 0) {
           for (const userId of this.activeConnections.keys()) {
             // Exclude origin user and filter by subscriptions
             const filtered = successfulChanges.filter(
-              (c) => c.userId !== userId && this.shouldReceiveChange(userId, c)
+              (c) =>
+                c.userId !== userId &&
+                this.subscriptionMatcher.shouldReceiveChange(userId, c)
+                  .shouldReceive
             );
             if (filtered.length > 0) {
               const socketIds = this.activeConnections.get(userId);
               if (socketIds) {
-                socketIds.forEach((socketId) => {
+                socketIds.forEach(async (socketId) => {
                   // Skip sender if BROADCAST_TO_SENDER is false
                   if (!this.broadcastToSender && socketId === socket.id) {
                     return;
                   }
-                  this.io.to(socketId).emit("sync:changes", filtered);
+                  // Emit changes individually to stay under 1MB limit
+                  // broadcastProcessor already applied by emitChangesSafely
+                  await this.emitChangesSafely(
+                    socket,
+                    socketId,
+                    filtered,
+                    userId
+                  );
                 });
               }
             }
           }
-          // Transient subscriptions broadcast (per socket)
-          this.io.sockets.sockets.forEach((s) => {
-            const filtered = successfulChanges.filter((c) =>
-              this.matchesTransientSubscription(s, c)
-            );
-            if (filtered.length > 0) {
-              s.emit("sync:changes", filtered);
-            }
-          });
         }
 
-        callback(results);
+        const response = await this.processCallback(
+          socket,
+          "sync:batch_changes",
+          results,
+          changes
+        );
+        callback(response);
         console.log(
           `✅ Batch processed: ${results.filter((r) => r.success).length}/${changes.length} succeeded`
         );
@@ -1190,6 +1547,10 @@ export class SyncServer {
             if (filter) {
               // Substitute args into filter before translation
               let finalFilter = filter;
+              console.log(
+                `🔍 [sync:get_changes] Original filter: "${filter}", args:`,
+                args
+              );
               if (args && args.length > 0) {
                 args.forEach((arg, idx) => {
                   const placeholder = `$${idx}`;
@@ -1201,24 +1562,44 @@ export class SyncServer {
                   );
                 });
               }
+              console.log(
+                `🔍 [sync:get_changes] After arg substitution: "${finalFilter}"`
+              );
               const translated = this.queryTranslator.toMongoQuery(finalFilter);
+              console.log(
+                `🔍 [sync:get_changes] Translated to MongoDB:`,
+                JSON.stringify(translated)
+              );
               mongoQuery = { ...mongoQuery, ...translated };
+              console.log(
+                `🔍 [sync:get_changes] Final MongoDB query:`,
+                JSON.stringify(mongoQuery)
+              );
             }
+
             const docs = await this.db.getDocumentsForSubscription(
               collection,
               mongoQuery,
               limit
             );
-            changes = docs.map((d: any) => ({
-              id: `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
-              userId: userId || "anonymous",
-              timestamp: d.sync_updated_at || Date.now(),
-              operation: "update",
-              collection,
-              documentId: d._id?.toString?.() || d._id,
-              data: d,
-              synced: true,
-            }));
+            console.log(
+              `🔍 [sync:get_changes] Found ${docs.length} documents matching query`
+            );
+
+            changes = docs.map((d: any) => {
+              // Ensure sync_update_db is false to prevent client from re-syncing
+              const data = { ...d, sync_update_db: false };
+              return {
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
+                userId: userId || "anonymous",
+                timestamp: d.sync_updated_at || Date.now(),
+                operation: "update",
+                collection,
+                documentId: d._id?.toString?.() || d._id,
+                data,
+                synced: true,
+              };
+            });
           } else {
             // Fallback to general change log
             changes = await this.db.getChangesSince(userId, since, limit);
@@ -1229,22 +1610,53 @@ export class SyncServer {
               ? Math.max(since, ...changes.map((c) => c.timestamp))
               : since;
 
-          const response: SyncResponse = {
-            changes,
+          // Send changes individually via emit to stay under 1MB limit
+          // Then send summary via callback
+          if (changes.length > 0) {
+            console.log(
+              `📥 Emitting ${changes.length} changes individually to user ${userId} (collection=${collection || "*"})`
+            );
+            await this.emitChangesSafely(socket, socket.id, changes, userId);
+          }
+
+          // Send lightweight summary response via callback
+          const response = {
             latestTimestamp,
             hasMore: changes.length === limit,
+            count: changes.length,
           };
 
           if (typeof callback === "function") {
-            callback(response);
+            const processedResponse = await this.processCallback(
+              socket,
+              "sync:get_changes",
+              response,
+              request
+            );
+            fs.writeFileSync(
+              "./debug_get_changes_response.json",
+              JSON.stringify(processedResponse, null, 2)
+            );
+            callback(processedResponse);
+            console.log(
+              `✅ Sent summary for ${changes.length} changes to user ${userId} (collection=${collection || "*"})`
+            );
           }
-          console.log(
-            `📥 Sent ${changes.length} changes to user ${userId} (collection=${collection || "*"})`
-          );
         } catch (error: any) {
           console.error("❌ Error fetching changes:", error);
           if (typeof callback === "function") {
-            callback({ changes: [], latestTimestamp: 0, hasMore: false });
+            const response = await this.processCallback(
+              socket,
+              "sync:get_changes",
+              {
+                latestTimestamp: 0,
+                hasMore: false,
+                count: 0,
+                error: error.message,
+              },
+              request
+            );
+            callback(response);
           }
         }
       });
@@ -1268,21 +1680,42 @@ export class SyncServer {
             .getCollection(collection)
             .findOne(filter);
           if (typeof callback === "function") {
-            callback({ success: true, data: result });
+            const response = await this.processCallback(
+              socket,
+              "test:query",
+              { success: true, data: result },
+              payload
+            );
+            callback(response);
           }
         } catch (error: any) {
           console.error("❌ Test query error:", error);
           if (typeof callback === "function") {
-            callback({ success: false, error: error.message });
+            const response = await this.processCallback(
+              socket,
+              "test:query",
+              { success: false, error: error.message },
+              payload
+            );
+            callback(response);
           }
         }
       });
 
       // Handle ping for keepalive (callback optional)
-      socket.on("ping", (callback?) => {
-        const payload = { timestamp: Date.now() };
-        if (typeof callback === "function") {
-          callback(payload);
+      socket.on("ping", (data?: any, callback?: any) => {
+        // Handle both signatures: ping(callback) and ping(data, callback)
+        const actualCallback = typeof data === "function" ? data : callback;
+        const clientTimestamp = typeof data === "object" ? data?.t : undefined;
+
+        const payload = {
+          timestamp: Date.now(),
+          clientTimestamp,
+          latency: clientTimestamp ? Date.now() - clientTimestamp : undefined,
+        };
+
+        if (typeof actualCallback === "function") {
+          actualCallback(payload);
         } else {
           // For clients that don't use ACK callbacks, emit a 'pong'
           socket.emit("pong", payload);
@@ -1312,15 +1745,21 @@ export class SyncServer {
             if (connections.size === 0) {
               this.activeConnections.delete(userId);
 
+              const hasSubscriptions = this.userSubscriptions.has(userId);
+              console.log(
+                `🔍 [disconnect] User ${userId} fully disconnected, hasSubscriptions=${hasSubscriptions}`
+              );
+
               // Schedule memory cleanup after 5 minutes of inactivity
               // This allows quick reconnects without reloading subscriptions from DB
               setTimeout(
                 () => {
                   // Check if user reconnected during timeout
                   if (!this.activeConnections.has(userId)) {
+                    const hadSubs = this.userSubscriptions.has(userId);
                     this.userSubscriptions.delete(userId);
                     console.log(
-                      `🧹 Cleared subscription cache for inactive user: ${userId}`
+                      `🧹 Cleared subscription cache for inactive user: ${userId} (had subscriptions: ${hadSubs})`
                     );
                   }
                 },
@@ -1359,6 +1798,11 @@ export class SyncServer {
     // Cleanup plugins
     await this.pluginManager.cleanup();
 
+    // Cleanup auth manager
+    if (this.authManager) {
+      await this.authManager.cleanup();
+    }
+
     this.io.close();
     await this.db.close();
     if (this.cleanupInterval) {
@@ -1392,6 +1836,67 @@ export class SyncServer {
   }
 
   /**
+   * Process callback through plugin system before sending
+   */
+  private async processCallback(
+    socket: Socket,
+    eventName: string,
+    response: any,
+    originalData?: any
+  ): Promise<any> {
+    return await this.pluginManager.executeCallbackProcessor(
+      socket,
+      eventName,
+      response,
+      originalData
+    );
+  }
+
+  /**
+   * Safely emit changes individually to stay under Azure Pub Sub 1MB limit
+   * Emits each change as a single-item array to ensure compatibility with client expectations
+   */
+  private async emitChangesSafely(
+    socket: Socket,
+    socketId: string,
+    changes: Change[],
+    targetUserId: string,
+    skipSizeCheck: boolean = false
+  ): Promise<void> {
+    for (const change of changes) {
+      // Apply broadcast processor hook (e.g., decryption)
+      let processedChange = change;
+      const modifiedChange = await this.pluginManager.executeBroadcastProcessor(
+        socket,
+        change,
+        targetUserId
+      );
+      if (modifiedChange) {
+        processedChange = modifiedChange;
+      }
+
+      // Ensure sync_update_db is false to prevent client from re-syncing this data
+      if (processedChange.data) {
+        processedChange.data.sync_update_db = false;
+      }
+
+      if (!skipSizeCheck) {
+        const estimatedSize = JSON.stringify([processedChange]).length;
+
+        if (estimatedSize > this.maxMessageSize) {
+          console.warn(
+            `⚠️ Change ${processedChange.id} exceeds max message size (${estimatedSize} bytes > ${this.maxMessageSize} bytes), skipping emission`
+          );
+          continue;
+        }
+      }
+
+      // Emit as single-item array for client compatibility
+      this.io.to(socketId).emit("sync:changes", [processedChange]);
+    }
+  }
+
+  /**
    * Bootstrap a subscription by sending initial matching data
    */
   private async bootstrapSubscription(
@@ -1407,29 +1912,41 @@ export class SyncServer {
         "bootstrapping"
       );
 
+      // Substitute args ($0, $1, ...) into query before translation
+      let finalQuery = subscription.query || "";
+      if (subscription.args && Array.isArray(subscription.args)) {
+        subscription.args.forEach((arg: any, idx: number) => {
+          const placeholder = `$${idx}`;
+          const value = typeof arg === "string" ? `'${arg}'` : String(arg);
+          finalQuery = finalQuery.replace(
+            new RegExp(`\\${placeholder}\\b`, "g"),
+            value
+          );
+        });
+      }
       // Translate RQL query to MongoDB query
-      const mongoQuery = this.queryTranslator.toMongoQuery(subscription.query);
+      const mongoQuery = this.queryTranslator.toMongoQuery(finalQuery);
 
       console.log(
-        `🔄 Bootstrapping subscription: ${subscription.name || subscription.collection} (query: ${subscription.query})`
+        `🔄 Bootstrapping subscription: ${subscription.name || subscription.collection} (query: ${finalQuery})`
       );
 
       // Fetch initial data
-      const documents = await this.db.getDocumentsForSubscription(
-        subscription.collection,
-        mongoQuery,
-        1000 // Limit initial bootstrap
-      );
+      // const documents = await this.db.getDocumentsForSubscription(
+      //   subscription.collection,
+      //   mongoQuery,
+      //   this.bootstrapLimit // Limit initial bootstrap (env configurable)
+      // );
 
-      // Send bootstrap data
-      const bootstrapData: BootstrapData = {
-        subscription: subscription.name || subscription.collection,
-        collection: subscription.collection,
-        data: documents,
-        hasMore: documents.length >= 1000,
-      };
+      // // Send bootstrap data
+      // const bootstrapData: BootstrapData = {
+      //   subscription: subscription.name || subscription.collection,
+      //   collection: subscription.collection,
+      //   data: documents,
+      //   hasMore: documents.length >= this.bootstrapLimit,
+      // };
 
-      socket.emit("sync:bootstrap", bootstrapData);
+      // socket.emit("sync:bootstrap", bootstrapData);
 
       // Mark subscription as complete
       await this.db.updateSubscriptionState(
@@ -1438,9 +1955,9 @@ export class SyncServer {
         "complete"
       );
 
-      console.log(
-        `✅ Bootstrapped ${documents.length} documents for subscription ${subscription.name || subscription.collection}`
-      );
+      // console.log(
+      //   `✅ Bootstrapped ${documents.length} documents for subscription ${subscription.name || subscription.collection}`
+      // );
     } catch (error) {
       console.error(`Failed to bootstrap subscription:`, error);
       await this.db.updateSubscriptionState(
@@ -1461,93 +1978,11 @@ export class SyncServer {
   }
 
   /**
-   * Check if a user should receive a change based on their subscriptions
+   * @deprecated Use subscriptionMatcher.shouldReceiveChange() instead
+   * Legacy method kept for backward compatibility
    */
   private shouldReceiveChange(userId: string, change: Change): boolean {
-    // If no subscriptions defined, fall back to broadcasting all changes (legacy behavior)
-    const subscriptionSet = this.userSubscriptions.get(userId);
-    if (
-      !subscriptionSet ||
-      !subscriptionSet.subscriptions ||
-      subscriptionSet.subscriptions.length === 0
-    ) {
-      return true;
-    }
-
-    // Check if any subscription matches this change
-    for (const sub of subscriptionSet.subscriptions) {
-      // Check collection match
-      if (sub.collection !== change.collection) {
-        continue;
-      }
-
-      // Check if change data matches subscription query
-      try {
-        const document = change.data || { _id: change.documentId };
-        if (this.queryTranslator.matchesQuery(document, sub.query)) {
-          return true;
-        }
-      } catch (error) {
-        console.warn(
-          `Error evaluating query for subscription ${sub.name}:`,
-          error
-        );
-        // On error, be permissive and send the change
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  /**
-   * Check if a socket's transient subscriptions match the change
-   */
-  private matchesTransientSubscription(
-    socket: Socket,
-    change: Change
-  ): boolean {
-    // We stored transient subscriptions per-socket in the connection scope,
-    // but here we reconstruct from socket.data if present for robustness.
-    const subs: Map<string, Array<{ query: string; args?: any[] }>> = (socket
-      .data.transientSubscriptions as any) || undefined;
-    // Fallback: if not on socket.data, try a weak reference cache via symbol
-    const anySocket: any = socket as any;
-    const localSubs: Map<
-      string,
-      Array<{ query: string; args?: any[] }>
-    > = anySocket.transientSubscriptions || subs;
-    if (!localSubs || localSubs.size === 0) return false;
-    const list = localSubs.get(change.collection);
-    if (!list || list.length === 0) return false;
-    const doc = change.data || { _id: change.documentId };
-    for (const s of list) {
-      try {
-        if (!s.query || s.query.trim() === "") return true; // match-all
-        // Substitute args into query if present
-        let finalQuery = s.query;
-        if (s.args && s.args.length > 0) {
-          s.args.forEach((arg, idx) => {
-            const placeholder = `$${idx}`;
-            const value = typeof arg === "string" ? `'${arg}'` : String(arg);
-            // Use correct escaping: \$ matches literal $, \b for word boundary
-            finalQuery = finalQuery.replace(
-              new RegExp(`\\${placeholder}\\b`, "g"),
-              value
-            );
-          });
-        }
-        if (this.queryTranslator.matchesQuery(doc, finalQuery)) {
-          return true;
-        }
-      } catch (e) {
-        // On translator error, be conservative and skip
-        console.warn(
-          `Subscription match error for ${change.collection}/${change.documentId}:`,
-          e
-        );
-      }
-    }
-    return false;
+    return this.subscriptionMatcher.shouldReceiveChange(userId, change)
+      .shouldReceive;
   }
 }

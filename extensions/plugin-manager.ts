@@ -217,6 +217,76 @@ export class PluginManager {
   }
 
   /**
+   * Execute broadcastProcessor hooks (can modify change before broadcasting)
+   */
+  async executeBroadcastProcessor(
+    socket: Socket,
+    change: Change,
+    targetUserId: string
+  ): Promise<Change | void> {
+    let modifiedChange: Change | void = change;
+
+    for (const plugin of this.plugins) {
+      if (plugin.hooks?.broadcastProcessor) {
+        try {
+          const result = await plugin.hooks.broadcastProcessor(
+            socket,
+            modifiedChange || change,
+            targetUserId
+          );
+          if (result) {
+            modifiedChange = result;
+          }
+        } catch (error) {
+          console.error(
+            `⚠️ Plugin ${plugin.name} broadcastProcessor hook failed:`,
+            error
+          );
+          // Don't throw - continue with original change
+        }
+      }
+    }
+
+    return modifiedChange;
+  }
+
+  /**
+   * Execute callbackProcessor hooks (can modify callback response)
+   */
+  async executeCallbackProcessor(
+    socket: Socket,
+    eventName: string,
+    response: any,
+    originalData?: any
+  ): Promise<any> {
+    let modifiedResponse = response;
+
+    for (const plugin of this.plugins) {
+      if (plugin.hooks?.callbackProcessor) {
+        try {
+          const result = await plugin.hooks.callbackProcessor(
+            socket,
+            eventName,
+            modifiedResponse,
+            originalData
+          );
+          if (result !== undefined) {
+            modifiedResponse = result;
+          }
+        } catch (error) {
+          console.error(
+            `⚠️ Plugin ${plugin.name} callbackProcessor hook failed:`,
+            error
+          );
+          // Don't throw - continue with current response
+        }
+      }
+    }
+
+    return modifiedResponse;
+  }
+
+  /**
    * Execute onDisconnect hooks
    */
   async executeOnDisconnect(socket: Socket, userId?: string): Promise<void> {

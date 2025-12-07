@@ -38,6 +38,21 @@ export interface EventHooks {
   /** Called after a change is successfully applied */
   afterChange?: (socket: Socket, change: Change) => Promise<void> | void;
 
+  /** Called before broadcasting a change (can transform the change data) */
+  broadcastProcessor?: (
+    socket: Socket,
+    change: Change,
+    targetUserId: string
+  ) => Promise<Change | void> | Change | void;
+
+  /** Called before sending a callback response (can transform the response) */
+  callbackProcessor?: (
+    socket: Socket,
+    eventName: string,
+    response: any,
+    originalData?: any
+  ) => Promise<any> | any;
+
   /** Called before subscriptions are updated */
   beforeUpdateSubscriptions?: (
     socket: Socket,

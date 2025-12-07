@@ -13,6 +13,12 @@ import * as dotenv from "dotenv";
 dotenv.config();
 
 import { SyncServer } from "./sync-server";
+import {
+  AuthManager,
+  AuthStrategy,
+  createJWTProviderFromEnv,
+  createFirebaseProviderFromEnv,
+} from "../shared/auth-index";
 import { SyncServerPlugin } from "../extensions/plugin-types";
 import { Socket } from "socket.io";
 import { Change } from "../shared/types";
@@ -310,12 +316,24 @@ async function main() {
     }
   }
 
+  // Configure provider-based authentication
+  const authManager = new AuthManager({
+    strategy: AuthStrategy.FIRST_SUCCESS,
+    allowAnonymous: process.env.NODE_ENV !== "production",
+    requireAuthInProduction: true,
+    env: process.env.NODE_ENV,
+  });
+  authManager.registerProvider(createJWTProviderFromEnv());
+  authManager.registerProvider(createFirebaseProviderFromEnv());
+  await authManager.initialize();
+
   // Create server instance
   const server = new SyncServer(
     process.env.MONGODB_URI!,
     process.env.WEB_PUBSUB_CONNECTION_STRING!,
     process.env.WEB_PUBSUB_HUB_NAME!,
-    parseInt(process.env.PORT || "3000")
+    parseInt(process.env.PORT || "3000"),
+    authManager
   );
 
   // Register all plugins
