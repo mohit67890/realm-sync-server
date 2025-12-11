@@ -16,3 +16,7 @@ build/
 *.tsbuildinfo
 emotionly/
 server/emo-server.ts
+Procfile
+deploy-with-blob.sh
+deploy/
+deploy.zip
